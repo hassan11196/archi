@@ -416,7 +416,7 @@ class PostgresCatalogService:
         return doc
 
     # =========================================================================
-    # Per-Chat Document Selection Methods (uses conversation_doc_overrides)
+    # Per-Chat Document Selection Methods (uses conversation_document_overrides)
     # =========================================================================
 
     def is_document_enabled(self, conversation_id: str, document_hash: str) -> bool:
@@ -424,8 +424,10 @@ class PostgresCatalogService:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT enabled FROM conversation_doc_overrides 
-                    WHERE conversation_id = %s AND document_hash = %s
+                    SELECT o.enabled 
+                    FROM conversation_document_overrides o
+                    JOIN documents d ON o.document_id = d.id
+                    WHERE o.conversation_id = %s AND d.resource_hash = %s
                 """, (int(conversation_id), document_hash))
                 row = cur.fetchone()
         
@@ -435,15 +437,20 @@ class PostgresCatalogService:
 
     def set_document_enabled(self, conversation_id: str, document_hash: str, enabled: bool) -> None:
         """Set whether a document is enabled for a conversation."""
+        # First get the document_id from resource_hash
+        document_id = self.get_document_id(document_hash)
+        if document_id is None:
+            raise ValueError(f"Document with hash {document_hash} not found")
+        
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO conversation_doc_overrides (conversation_id, document_hash, enabled)
+                    INSERT INTO conversation_document_overrides (conversation_id, document_id, enabled)
                     VALUES (%s, %s, %s)
-                    ON CONFLICT (conversation_id, document_hash) DO UPDATE SET
+                    ON CONFLICT (conversation_id, document_id) DO UPDATE SET
                         enabled = EXCLUDED.enabled,
                         updated_at = NOW()
-                """, (int(conversation_id), document_hash, enabled))
+                """, (int(conversation_id), document_id, enabled))
             conn.commit()
 
     def bulk_set_enabled(self, conversation_id: str, document_hashes: Sequence[str], enabled: bool) -> int:
@@ -454,13 +461,17 @@ class PostgresCatalogService:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 for doc_hash in document_hashes:
+                    document_id = self.get_document_id(doc_hash)
+                    if document_id is None:
+                        continue  # Skip if document not found
+                    
                     cur.execute("""
-                        INSERT INTO conversation_doc_overrides (conversation_id, document_hash, enabled)
+                        INSERT INTO conversation_document_overrides (conversation_id, document_id, enabled)
                         VALUES (%s, %s, %s)
-                        ON CONFLICT (conversation_id, document_hash) DO UPDATE SET
+                        ON CONFLICT (conversation_id, document_id) DO UPDATE SET
                             enabled = EXCLUDED.enabled,
                             updated_at = NOW()
-                    """, (int(conversation_id), doc_hash, enabled))
+                    """, (int(conversation_id), document_id, enabled))
             conn.commit()
         return len(document_hashes)
 
@@ -469,8 +480,10 @@ class PostgresCatalogService:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT document_hash FROM conversation_doc_overrides 
-                    WHERE conversation_id = %s AND NOT enabled
+                    SELECT d.resource_hash 
+                    FROM conversation_document_overrides o
+                    JOIN documents d ON o.document_id = d.id
+                    WHERE o.conversation_id = %s AND NOT o.enabled
                 """, (int(conversation_id),))
                 rows = cur.fetchall()
         return {row[0] for row in rows}
@@ -480,8 +493,10 @@ class PostgresCatalogService:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT document_hash FROM conversation_doc_overrides 
-                    WHERE conversation_id = %s AND enabled
+                    SELECT d.resource_hash 
+                    FROM conversation_document_overrides o
+                    JOIN documents d ON o.document_id = d.id
+                    WHERE o.conversation_id = %s AND o.enabled
                 """, (int(conversation_id),))
                 rows = cur.fetchall()
         return {row[0] for row in rows}
@@ -491,8 +506,10 @@ class PostgresCatalogService:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT document_hash, enabled FROM conversation_doc_overrides 
-                    WHERE conversation_id = %s
+                    SELECT d.resource_hash, o.enabled 
+                    FROM conversation_document_overrides o
+                    JOIN documents d ON o.document_id = d.id
+                    WHERE o.conversation_id = %s
                 """, (int(conversation_id),))
                 rows = cur.fetchall()
         return {row[0]: bool(row[1]) for row in rows}
@@ -529,8 +546,8 @@ class PostgresCatalogService:
                 if conversation_id:
                     cur.execute("""
                         SELECT d.source_type, COUNT(*) as count
-                        FROM conversation_doc_overrides o
-                        JOIN documents d ON o.document_hash = d.resource_hash
+                        FROM conversation_document_overrides o
+                        JOIN documents d ON o.document_id = d.id
                         WHERE o.conversation_id = %s AND NOT o.enabled AND NOT d.is_deleted
                         GROUP BY d.source_type
                     """, (int(conversation_id),))

@@ -1,6 +1,7 @@
 from src.data_manager.vectorstore.postgres_vectorstore import PostgresVectorStore
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
+from src.utils.config_service import ConfigService
 
 logger = get_logger(__name__)
 
@@ -22,9 +23,12 @@ class VectorstoreConnector:
         Initialize the vectorstore parameters from the config.
         """
         dm_config = self.config["data_manager"]
-        
+
         # Initialize embedding model
-        embedding_class_map = dm_config["embedding_class_map"]
+        embedding_class_map = ConfigService._resolve_embedding_classes(
+            dm_config["embedding_class_map"]
+        )
+
         embedding_name = dm_config["embedding_name"]
         self.embedding_model = embedding_class_map[embedding_name]["class"](
             **embedding_class_map[embedding_name]["kwargs"]

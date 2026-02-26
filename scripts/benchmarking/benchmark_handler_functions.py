@@ -337,9 +337,9 @@ class output_handler:
 
         return config.get('archi').get('pipeline_map').get(pipeline_name).get('models')
 
-    def get_model_class_map(self, name):
+    def get_providers(self, name):
         config = self.config_info[name]
-        return config.get('model_class_map') 
+        return (config.get('archi') or {}).get('providers', {})
 
     def get_prompts(self, name):
         config = self.config_info[name]

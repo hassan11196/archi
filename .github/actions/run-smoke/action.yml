@@ -59,6 +59,11 @@ runs:
       run: |
         set -euo pipefail
         chmod +x tests/smoke/*.sh scripts/dev/run_smoke_preview.sh
+    - name: Install archi from workspace (sync templates)
+      shell: bash
+      run: |
+        set -euo pipefail
+        pip install -e .
 
     - name: Run shared smoke runner
       shell: bash
@@ -74,6 +79,7 @@ runs:
         WAIT_SLEEP: ${{ inputs.wait-sleep-seconds }}
         BASE_URL: ${{ inputs.base-url }}
         USE_PODMAN: ${{ inputs.use-podman }}
+        HOME: ${{ github.workspace }}
       run: |
         set -euo pipefail
         ./scripts/dev/run_smoke_preview.sh "${DEPLOYMENT_NAME}"

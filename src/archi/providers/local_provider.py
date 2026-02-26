@@ -15,81 +15,6 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Common local models - these are just suggestions, actual models depend on what's installed
-DEFAULT_LOCAL_MODELS = [
-    ModelInfo(
-        id="llama3.2",
-        name="llama3.2",
-        display_name="Llama 3.2 (Local)",
-        context_window=128000,
-        supports_tools=True,
-        supports_streaming=True,
-        supports_vision=True,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="llama3.1:8b",
-        name="llama3.1:8b",
-        display_name="Llama 3.1 8B (Local)",
-        context_window=128000,
-        supports_tools=True,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="llama3.1:70b",
-        name="llama3.1:70b",
-        display_name="Llama 3.1 70B (Local)",
-        context_window=128000,
-        supports_tools=True,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="qwen2.5:7b",
-        name="qwen2.5:7b",
-        display_name="Qwen 2.5 7B (Local)",
-        context_window=32768,
-        supports_tools=True,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="mistral",
-        name="mistral",
-        display_name="Mistral (Local)",
-        context_window=32768,
-        supports_tools=True,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="deepseek-r1:8b",
-        name="deepseek-r1:8b",
-        display_name="DeepSeek R1 8B (Local)",
-        context_window=64000,
-        supports_tools=False,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=8192,
-    ),
-    ModelInfo(
-        id="phi3",
-        name="phi3",
-        display_name="Phi-3 (Local)",
-        context_window=4096,
-        supports_tools=False,
-        supports_streaming=True,
-        supports_vision=False,
-        max_output_tokens=4096,
-    ),
-]
-
-
 class LocalProvider(BaseProvider):
     """
     Provider for local LLM servers (Ollama, vLLM, LM Studio, etc.)
@@ -106,26 +31,40 @@ class LocalProvider(BaseProvider):
     
     DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
     DEFAULT_OPENAI_COMPAT_BASE_URL = "http://localhost:8000/v1"
+
+    @staticmethod
+    def _normalize_base_url(url: Optional[str]) -> Optional[str]:
+        """Ensure the base URL has a scheme so urllib requests succeed."""
+        if not url:
+            return url
+        if url.startswith(("http://", "https://")):
+            return url
+        return f"http://{url}"
     
     def __init__(self, config: Optional[ProviderConfig] = None):
         import os
         
-        # Check for OLLAMA_HOST environment variable (supports Docker deployments)
-        ollama_host = os.environ.get("OLLAMA_HOST", self.DEFAULT_OLLAMA_BASE_URL)
-        
+        # Check for OLLAMA_HOST environment variable (supports Docker/Podman deployments)
+        # If set, prefer it over the config value so runners can override host/port
+        env_ollama_host = self._normalize_base_url(os.environ.get("OLLAMA_HOST"))
+        default_ollama_host = env_ollama_host or self.DEFAULT_OLLAMA_BASE_URL
+
         if config is None:
             config = ProviderConfig(
                 provider_type=ProviderType.LOCAL,
-                base_url=ollama_host,
-                models=[],  # Empty list triggers dynamic fetch
-                default_model="",  # Will be set from first available model
+                base_url=default_ollama_host,
+                models=[],  # dynamic fetch
+                default_model="",  # set from first available model if present
                 # Default to Ollama mode
                 extra_kwargs={"local_mode": "ollama"},
             )
         else:
-            # If config provided but no base_url, use env var
-            if not config.base_url:
-                config.base_url = ollama_host
+            # Let env override the config base_url when provided (useful in CI)
+            if env_ollama_host:
+                config.base_url = env_ollama_host
+            elif not config.base_url:
+                config.base_url = default_ollama_host
+            config.base_url = self._normalize_base_url(config.base_url)
         super().__init__(config)
     
     @property
@@ -158,7 +97,7 @@ class LocalProvider(BaseProvider):
             **self.config.extra_kwargs,
             **kwargs,
         }
-        
+
         # Remove local_mode from kwargs as ChatOllama doesn't accept it
         model_kwargs.pop("local_mode", None)
         
@@ -188,20 +127,20 @@ class LocalProvider(BaseProvider):
     def list_models(self) -> List[ModelInfo]:
         """
         List available local models.
-        
+
         For Ollama, dynamically queries the Ollama API to get installed models.
-        Falls back to configured models if the query fails.
+        Falls back to configured models if the query fails; returns empty list otherwise.
         """
         if self.local_mode == "ollama":
             # Try to get installed models dynamically
             installed = self._fetch_ollama_models()
             if installed:
                 return installed
-        
+
         # Fall back to configured models
         if self.config.models:
             return self.config.models
-        return DEFAULT_LOCAL_MODELS
+        return []
     
     def _fetch_ollama_models(self) -> List[ModelInfo]:
         """
@@ -215,6 +154,7 @@ class LocalProvider(BaseProvider):
         
         try:
             base_url = self.config.base_url or self.DEFAULT_OLLAMA_BASE_URL
+            logger.debug(f"[LocalProvider] Fetching Ollama models from {base_url}")
             url = f"{base_url}/api/tags"
             
             req = urllib.request.Request(url, method="GET")
@@ -248,9 +188,13 @@ class LocalProvider(BaseProvider):
                             supports_vision=supports_vision,
                             max_output_tokens=8192,
                         ))
+                    logger.debug(
+                        f"[LocalProvider] Discovered {len(models)} models from Ollama: "
+                        f"{[m.id for m in models]}"
+                    )
                     return models
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
-            logger.debug(f"Failed to fetch Ollama models: {e}")
+            logger.warning(f"[LocalProvider] Failed to fetch Ollama models from {self.config.base_url}: {e}")
         
         return []
     

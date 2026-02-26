@@ -470,7 +470,7 @@ function buildPreviewHtml(content, headExtras, sourceType) {
     const looksLikeHtml =
         /<\/?(html|body|p|div|span|h[1-6]|!doctype)/i.test(safeContent) ||
         safeContent.trim().startsWith("<") ||
-        type === "links";
+        type === "web";
 
     if (looksLikeHtml) {
         let html = safeContent;

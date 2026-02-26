@@ -54,10 +54,11 @@ class FlaskAppWrapper:
         secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY") or secrets.token_hex(32)
         self.app.secret_key = secret_key
         self.app.config["SESSION_COOKIE_NAME"] = "uploader_session"
+        self.app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB upload limit
 
         self.auth_config = (self.services_config or {}).get("data_manager", {}).get("auth", {}) or {}
-        self.auth_enabled = bool(self.auth_config.get("enabled", True))
-        self.api_token = (read_secret("DM_API_TOKEN") or "").strip() or None
+        self.auth_enabled = bool(self.auth_config.get("enabled", False))
+        self.api_token = read_secret("DM_API_TOKEN") or None
         self.admin_users = {
             user.strip().lower()
             for user in (self.auth_config.get("admins") or [])
@@ -122,10 +123,11 @@ class FlaskAppWrapper:
                 return handler(*args, **kwargs)
             if session.get("admin_logged_in"):
                 return handler(*args, **kwargs)
-            if request.path.startswith("/api/"):
-                if self._api_token_valid():
+            # Allow service-to-service calls authenticated via API token
+            if self.api_token:
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header == f"Bearer {self.api_token}":
                     return handler(*args, **kwargs)
-                return jsonify({"error": "unauthorized", "message": "Authentication required"}), 401
             return redirect(url_for("login"))
 
         return wrapped
@@ -139,27 +141,6 @@ class FlaskAppWrapper:
         if not self.admin_users:
             return True
         return normalized in self.admin_users
-
-    def _api_token_valid(self) -> bool:
-        if not self.api_token:
-            return False
-        token = self._extract_api_token()
-        if not token:
-            return False
-        return secrets.compare_digest(token, self.api_token)
-
-    @staticmethod
-    def _extract_api_token() -> Optional[str]:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header.split(" ", 1)[1].strip()
-            return token or None
-        token = (
-            request.headers.get("X-ARCHI-API-TOKEN")
-            or request.headers.get("X-API-Token")
-            or request.headers.get("X-API-Key")
-        )
-        return token.strip() if token else None
 
     def login(self):
         if not self.auth_enabled:
@@ -188,7 +169,7 @@ class FlaskAppWrapper:
         return redirect(url_for("login"))
 
     def health(self):
-        return jsonify({"status": "OK"}, 200)
+        return jsonify({"status": "OK"}), 200
 
     def index(self):
         return redirect(url_for("document_index"))
@@ -346,18 +327,19 @@ class FlaskAppWrapper:
             try:
                 self.scraper_manager.collect_links(self.persistence, link_urls=[url])
                 self.persistence.flush_index()
-                self._update_source_status("links", state="idle", last_run=self._now_iso())
+                self._update_source_status("web", state="idle", last_run=self._now_iso())
                 added_to_urls = True
             except Exception as exc:
                 logger.exception("Failed to upload URL: %s", exc)
                 added_to_urls = False
+                upload_error = str(exc)
 
             if added_to_urls:
                 logger.info("URL uploaded successfully")
                 self._notify_update()
                 return jsonify({"status": "ok"})
             else:
-                return jsonify({"error": "upload_failed", "detail": str(exc)}), 500
+                return jsonify({"error": "upload_failed", "detail": upload_error}), 500
         else:
             return jsonify({"error": "missing_url"}), 400
 

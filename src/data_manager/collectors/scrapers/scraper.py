@@ -26,6 +26,13 @@ class LinkScraper:
         # seen_urls tracks anything queued/visited; visited_urls tracks pages actually crawled.
         self.visited_urls = set()
         self.seen_urls = set()
+    
+    def _is_image_url(self, url: str) -> bool:
+        """Check if URL points to an image file."""
+        image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp')
+        parsed_url = urlparse(url)
+        path = parsed_url.path.lower()
+        return any(path.endswith(ext) for ext in image_extensions)
 
     def reap(self, response, current_url: str, selenium_scrape: bool = False, authenticator = None):
         """
@@ -46,7 +53,7 @@ class LinkScraper:
         # mark as visited
         self._mark_visited(current_url)
 
-        source_type = "links" if (authenticator is None) else "sso"
+        source_type = "web" if (authenticator is None) else "sso"
         
         resources = []
 
@@ -191,8 +198,14 @@ class LinkScraper:
             session = requests.Session()
             cookies = browserclient.authenticate(normalized_start_url)
             if cookies is not None:
-                for cookie in cookies:
-                    session.cookies.set_cookie(cookie['name'], cookie['value'])
+                for cookie_args in cookies:
+                    cookie = requests.cookies.create_cookie(name=cookie_args['name'],
+                                                            value=cookie_args['value'],
+                                                            domain=cookie_args.get('domain'),
+                                                            path=cookie_args.get('path', '/'),
+                                                            expires=cookie_args.get('expires'),
+                                                            secure=cookie_args.get('secure', False))
+                    session.cookies.set_cookie(cookie)
 
         else: # pure html no browser client needed
             session = requests.Session()
@@ -205,6 +218,12 @@ class LinkScraper:
             
             # Skip if we've already visited this URL
             if current_url in self.visited_urls:
+                continue
+            
+            # Skip image files
+            if self._is_image_url(current_url):
+                logger.debug(f"Skipping image URL: {current_url}")
+                self._mark_visited(current_url)
                 continue
 
             logger.info(f"Crawling depth {depth + 1}/{max_depth}: {current_url}")

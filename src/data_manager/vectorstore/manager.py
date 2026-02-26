@@ -23,7 +23,7 @@ SUPPORTED_DISTANCE_METRICS = ["l2", "cosine", "ip"]
 class VectorStoreManager:
     """
     Encapsulates vectorstore configuration and synchronization.
-    
+
     Uses PostgreSQL with pgvector for vector storage and similarity search.
     """
 
@@ -41,7 +41,7 @@ class VectorStoreManager:
 
         self._data_manager_config = config["data_manager"]
         self._services_config = config.get("services", {})
-        
+
         if pg_config is None:
             pg_config = {
                 "password": read_secret("PG_PASSWORD"),
@@ -64,6 +64,9 @@ class VectorStoreManager:
 
         # Build embedding model
         embedding_class_map = self._data_manager_config["embedding_class_map"]
+        from src.utils.config_service import ConfigService
+        embedding_class_map = ConfigService._resolve_embedding_classes(embedding_class_map)
+
         embedding_entry = embedding_class_map[embedding_name]
         embedding_class = embedding_entry["class"]
         embedding_kwargs = embedding_entry.get("kwargs", {})
@@ -94,30 +97,59 @@ class VectorStoreManager:
                 )
                 self.parallel_workers = default_workers
         self.parallel_workers = max(1, self.parallel_workers)
-        
+
         logger.info(f"VectorStoreManager initialized: collection={self.collection_name}")
 
     def delete_existing_collection_if_reset(self) -> None:
-        """Delete the collection if reset_collection is enabled."""
+        """Delete the collection if reset_collection is enabled.
+
+        Truncates the ``document_chunks`` table and resets all documents'
+        ingestion status to ``'pending'`` so they get re-embedded.
+        """
         if not self._data_manager_config.get("reset_collection", False):
             return
 
         conn = psycopg2.connect(**self._pg_config)
         try:
             with conn.cursor() as cursor:
+                cursor.execute("TRUNCATE TABLE document_chunks CASCADE")
+                logger.info("Truncated document_chunks table")
+
+                # Reset ingestion status so all documents get re-embedded.
                 cursor.execute(
                     """
-                    DELETE FROM document_chunks 
-                    WHERE metadata->>'collection' = %s OR metadata->>'collection' IS NULL
-                    """,
-                    (self.collection_name,)
+                    UPDATE documents
+                    SET ingestion_status = 'pending',
+                        ingestion_error = NULL,
+                        indexed_at = NULL
+                    WHERE NOT is_deleted
+                    """
                 )
-                deleted = cursor.rowcount
+                reset_docs = cursor.rowcount
+
                 conn.commit()
+
+                conn.autocommit = True
+                cursor.execute("VACUUM FULL document_chunks")
+                conn.autocommit = False
+
                 logger.info(
-                    f"reset_collection is enabled; deleted {deleted} chunks from collection {self.collection_name}"
+                    "reset_collection is enabled; truncated document_chunks, "
+                    "reset %d documents for collection %s",
+                    reset_docs, self.collection_name,
                 )
+        except Exception as exc:
+            logger.error("Failed during collection reset: %s", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
+            try:
+                conn.autocommit = False
+            except Exception:
+                pass
             conn.close()
 
     def fetch_collection(self):
@@ -131,7 +163,7 @@ class VectorStoreManager:
             "ip": "inner_product",
         }
         pg_distance = distance_metric_map.get(self.distance_metric, "cosine")
-        
+
         store = PostgresVectorStore(
             pg_config=self._pg_config,
             embedding_function=self.embedding_model,
@@ -148,7 +180,7 @@ class VectorStoreManager:
 
         sources = PostgresCatalogService.load_sources_catalog(self.data_path, self._pg_config)
         logger.info(f"Loaded {len(sources)} sources from catalog")
-        
+
         # Get hashes currently in vectorstore
         hashes_in_vstore = self._collect_postgres_hashes()
         files_in_data = self._collect_indexed_documents(sources)
@@ -156,7 +188,7 @@ class VectorStoreManager:
         hashes_in_data = set(files_in_data.keys())
 
         logger.info(f"Files in catalog: {len(hashes_in_data)}, Files in vectorstore: {len(hashes_in_vstore)}")
-        
+
         if hashes_in_data == hashes_in_vstore:
             logger.info("Vectorstore is up to date")
         else:
@@ -173,7 +205,10 @@ class VectorStoreManager:
             }
             if files_to_add:
                 logger.info(f"Adding {len(files_to_add)} new documents")
-                self._add_to_postgres(files_to_add)
+                try:
+                    self._add_to_postgres(files_to_add)
+                except Exception as e:
+                    logger.error(f"Files could not be added",exc_info=e)
             logger.info("Vectorstore update has been completed")
 
         logger.info(f"N Collection: {store.count()}")
@@ -204,7 +239,7 @@ class VectorStoreManager:
                 for resource_hash in hashes_to_remove:
                     cursor.execute(
                         """
-                        DELETE FROM document_chunks 
+                        DELETE FROM document_chunks
                         WHERE metadata->>'resource_hash' = %s
                           AND (metadata->>'collection' = %s OR metadata->>'collection' IS NULL)
                         """,
@@ -219,6 +254,11 @@ class VectorStoreManager:
         """Add files to PostgreSQL vectorstore."""
         if not files_to_add:
             return
+        commit_batch_size = 25
+
+        # Mark all documents as 'embedding' before starting
+        for filehash in files_to_add:
+            self._catalog.update_ingestion_status(filehash, "embedding")
 
         files_to_add_items = list(files_to_add.items())
         apply_stemming = self._data_manager_config.get("stemming", {}).get("enabled", False)
@@ -234,9 +274,11 @@ class VectorStoreManager:
                 loader = self.loader(file_path)
             except Exception as exc:
                 logger.error(f"Failed to load file: {file_path}. Skipping. Exception: {exc}")
+                self._catalog.update_ingestion_status(filehash, "failed", str(exc))
                 return None
 
             if loader is None:
+                self._catalog.update_ingestion_status(filehash, "failed", f"Unsupported file format: {file_path}")
                 return None
 
             file_level_metadata = self._load_file_metadata(filehash)
@@ -244,6 +286,7 @@ class VectorStoreManager:
                 docs = loader.load()
             except Exception as exc:
                 logger.error("Failed to read file %s. Skipping. Exception: %s", file_path, exc)
+                self._catalog.update_ingestion_status(filehash, "failed", str(exc))
                 return None
 
             split_docs = self.text_splitter.split_documents(docs)
@@ -253,6 +296,9 @@ class VectorStoreManager:
 
             for index, split_doc in enumerate(split_docs):
                 chunk = split_doc.page_content or ""
+                # Remove NUL bytes that PostgreSQL cannot handle
+                chunk = chunk.replace('\x00', '')
+                
                 if apply_stemming:
                     words = tokenize(chunk)
                     chunk = " ".join(stem(word) for word in words)
@@ -274,6 +320,7 @@ class VectorStoreManager:
 
             if not chunks:
                 logger.info(f"No chunks generated for {filename}; skipping.")
+                self._catalog.update_ingestion_status(filehash, "failed", "No text chunks could be extracted")
                 return None
 
             return filename, chunks, metadatas
@@ -281,7 +328,7 @@ class VectorStoreManager:
         processed_results: Dict[str, tuple] = {}
         max_workers = max(1, self.parallel_workers)
         logger.info(f"Processing files with up to {max_workers} parallel workers")
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(process_file, filehash, file_path): filehash
@@ -297,25 +344,51 @@ class VectorStoreManager:
                         files_to_add.get(filehash),
                         exc,
                     )
+                    self._catalog.update_ingestion_status(filehash, "failed", str(exc))
                     continue
                 if result:
                     processed_results[filehash] = result
 
         logger.info("Finished processing files; adding to vectorstore")
-        
+
         # Batch insert to PostgreSQL
         conn = psycopg2.connect(**self._pg_config)
         try:
             with conn.cursor() as cursor:
                 import json
                 
-                for filehash, file_path in files_to_add_items:
+                total_files = len(files_to_add_items)
+                files_since_commit = 0
+                for file_idx, (filehash, file_path) in enumerate(files_to_add_items):
                     processed = processed_results.get(filehash)
                     if not processed:
                         continue
 
                     filename, chunks, metadatas = processed
-                    embeddings = self.embedding_model.embed_documents(chunks)
+                    logger.info(f"Embedding file {file_idx+1}/{total_files}: {filename} ({len(chunks)} chunks)")
+
+                    savepoint_name = f"sp_embed_{file_idx}"
+                    cursor.execute(f"SAVEPOINT {savepoint_name}")
+                    try:
+                        embeddings = self.embedding_model.embed_documents(chunks)
+                    except Exception as exc:
+                        logger.error(f"Failed to embed {filename}: {exc}")
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                        cursor.execute(
+                            """UPDATE documents
+                               SET ingestion_status = 'failed', ingestion_error = %s
+                               WHERE resource_hash = %s AND NOT is_deleted""",
+                            (str(exc), filehash),
+                        )
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                        files_since_commit += 1
+                        if files_since_commit >= commit_batch_size:
+                            conn.commit()
+                            logger.info("Committed embedding progress batch (%d files)", files_since_commit)
+                            files_since_commit = 0
+                        continue
+
+                    logger.info(f"Finished embedding {filename}")
                     
                     # Get document_id from the catalog (documents table)
                     document_id = self._catalog.get_document_id(filehash)
@@ -324,26 +397,60 @@ class VectorStoreManager:
 
                     insert_data = []
                     for idx, (chunk, embedding, metadata) in enumerate(zip(chunks, embeddings, metadatas)):
+                        # Ensure no NUL bytes in chunk or metadata JSON
+                        clean_chunk = chunk.replace('\x00', '')
+                        clean_metadata_json = json.dumps(metadata).replace('\x00', '')
+                        
                         insert_data.append((
                             document_id,  # Link to documents table
                             idx,   # chunk_index
-                            chunk,
+                            clean_chunk,
                             embedding,
-                            json.dumps(metadata),
+                            clean_metadata_json,
                         ))
 
-                    psycopg2.extras.execute_values(
-                        cursor,
-                        """
-                        INSERT INTO document_chunks (document_id, chunk_index, chunk_text, embedding, metadata)
-                        VALUES %s
-                        """,
-                        insert_data,
-                        template="(%s, %s, %s, %s::vector, %s::jsonb)",
-                    )
-                    logger.debug(f"Added {len(insert_data)} chunks for {filename} (document_id={document_id})")
+                    try:
+                        logger.debug(f"Inserting data in {filename} document_id = {document_id}")
+                        psycopg2.extras.execute_values(
+                            cursor,
+                            """
+                            INSERT INTO document_chunks (document_id, chunk_index, chunk_text, embedding, metadata)
+                            VALUES %s
+                            """,
+                            insert_data,
+                            template="(%s, %s, %s, %s::vector, %s::jsonb)",
+                        )
+                        logger.debug(f"Added {len(insert_data)} chunks for {filename} (document_id={document_id})")
 
-                conn.commit()
+                        # Update timestamps and mark as embedded
+                        cursor.execute(
+                            """UPDATE documents
+                               SET ingested_at = NOW(), ingestion_status = 'embedded',
+                                   ingestion_error = NULL, indexed_at = NOW()
+                               WHERE resource_hash = %s AND NOT is_deleted""",
+                            (filehash,),
+                        )
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    except Exception as exc:
+                        logger.error(f"Failed to store vectors for {filename}: {exc}")
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                        cursor.execute(
+                            """UPDATE documents
+                               SET ingestion_status = 'failed', ingestion_error = %s
+                               WHERE resource_hash = %s AND NOT is_deleted""",
+                            (str(exc), filehash),
+                        )
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+
+                    files_since_commit += 1
+                    if files_since_commit >= commit_batch_size:
+                        conn.commit()
+                        logger.info("Committed embedding progress batch (%d files)", files_since_commit)
+                        files_since_commit = 0
+
+                if files_since_commit > 0:
+                    conn.commit()
+                    logger.info("Committed final embedding progress batch (%d files)", files_since_commit)
         finally:
             conn.close()
 

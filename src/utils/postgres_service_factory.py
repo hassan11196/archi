@@ -102,14 +102,8 @@ class PostgresServiceFactory:
         encryption_key: Optional[str] = None,
     ) -> 'PostgresServiceFactory':
         """
-        Create factory from archi YAML config structure.
-        
-        Args:
-            config: Parsed YAML config with 'database' section
-            encryption_key: Key for BYOK API key encryption
-            
-        Returns:
-            Configured PostgresServiceFactory
+        Deprecated: create factory from archi YAML config structure.
+        Kept for startup ingest; runtime should use from_env/from_config.
         """
         db_config = config.get('database', {}).get('postgres', {})
         if not db_config:

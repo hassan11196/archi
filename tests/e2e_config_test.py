@@ -1,19 +1,18 @@
 #!/usr/bin/env python
 """
-End-to-end test for the Config Management system.
+End-to-end test for the Config Management system (Postgres-backed only).
 
 Tests:
-1. yaml_config module - loading YAML config files
-2. PromptService - loading prompt templates
-3. ModelRegistry - model class mapping
-4. ConfigService - database operations (mocked)
-5. Full integration flow
+1. PromptService - loading prompt templates
+2. ConfigService - database operations (mocked)
+3. Full integration flow
 """
 
 import os
 import sys
 import tempfile
 import shutil
+from types import SimpleNamespace
 
 import yaml
 from src.utils.postgres_service_factory import PostgresServiceFactory
@@ -25,6 +24,21 @@ class _FakeConfigService:
 
     def get_raw_config(self):
         return self._cfg
+
+    def get_static_config(self):
+        cfg = self._cfg or {}
+        return SimpleNamespace(
+            deployment_name=cfg.get("name"),
+            config_version=cfg.get("config_version"),
+            global_config=cfg.get("global"),
+            services_config=cfg.get("services"),
+            data_manager_config=cfg.get("data_manager"),
+            archi_config=cfg.get("archi"),
+            sources_config=cfg.get("sources"),
+            available_pipelines=cfg.get("available_pipelines", []),
+            available_models=cfg.get("available_models", []),
+            available_providers=cfg.get("available_providers", []),
+        )
 
     def initialize_from_yaml(self, cfg):
         self._cfg = cfg
@@ -43,78 +57,77 @@ def _clear_factory():
     PostgresServiceFactory.set_instance(None)
 
 
-def test_yaml_config():
-    """Test yaml_config module with a temporary config."""
-    print("\n[1/5] Testing yaml_config module...")
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        os.environ['ARCHI_CONFIGS_PATH'] = tmpdir
-        
-        config = {
-            'name': 'test-deployment',
-            'global': {
-                'DATA_PATH': '/tmp/data',
-                'verbosity': 3,
-                'ROLES': ['User', 'AI']
+def test_config_access_via_pg_stub():
+    """Test config_access helpers backed by stubbed ConfigService."""
+    print("\n[1/4] Testing config_access helpers...")
+
+    config = {
+        'name': 'test-deployment',
+        'global': {
+            'DATA_PATH': '/tmp/data',
+            'verbosity': 3,
+            'ROLES': ['User', 'AI']
+        },
+        'services': {
+            'postgres': {'host': 'localhost', 'port': 5432, 'database': 'archi'},
+            'chat_app': {
+                'agent_class': 'QAPipeline',
+                'default_provider': 'local',
+                'default_model': 'qwen3:4b',
+                'providers': {
+                    'local': {
+                        'enabled': True,
+                        'base_url': 'http://localhost:11434',
+                        'mode': 'ollama',
+                        'default_model': 'qwen3:4b',
+                        'models': ['qwen3:4b'],
+                    }
+                },
+                'port': 7868,
             },
-            'services': {
-                'postgres': {'host': 'localhost', 'port': 5432, 'database': 'archi'},
-                'chat_app': {'pipeline': 'QAPipeline', 'port': 7868}
+        },
+        'data_manager': {
+            'embedding_name': 'HuggingFaceEmbeddings',
+            'chunk_size': 1000,
+            'chunk_overlap': 150,
+            'embedding_class_map': {
+                'HuggingFaceEmbeddings': {'class': 'HuggingFaceEmbeddings', 'kwargs': {}}
             },
-            'data_manager': {
-                'embedding_name': 'HuggingFaceEmbeddings',
-                'chunk_size': 1000,
-                'chunk_overlap': 150
-            },
-            'archi': {
-                'pipelines': ['QAPipeline', 'AgentPipeline'],
-                'model_class_map': {
-                    'DumbLLM': {'kwargs': {}},
-                    'OpenAILLM': {'kwargs': {'model_name': 'gpt-4o'}}
-                }
-            }
-        }
-        
-        config_path = os.path.join(tmpdir, 'test.yaml')
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f)
+        },
+    }
 
-        _set_fake_factory(config)
-        
-        from src.utils.config_access import (
-            get_full_config,
-            get_global_config,
-            get_services_config,
-            get_data_manager_config,
-            get_archi_config,
-        )
+    _set_fake_factory(config)
 
-        loaded = get_full_config()
-        assert loaded['name'] == 'test-deployment'
-        print("   ✓ get_full_config works")
+    from src.utils.config_access import (
+        get_full_config,
+        get_global_config,
+        get_services_config,
+        get_data_manager_config,
+        get_archi_config,
+    )
 
-        global_cfg = get_global_config()
-        assert global_cfg['DATA_PATH'] == '/tmp/data'
-        print("   ✓ get_global_config works")
+    loaded = get_full_config()
+    assert loaded['name'] == 'test-deployment'
+    print("   ✓ get_full_config works")
 
-        services_cfg = get_services_config()
-        assert services_cfg['chat_app']['port'] == 7868
-        print("   ✓ get_services_config works")
+    global_cfg = get_global_config()
+    assert global_cfg['DATA_PATH'] == '/tmp/data'
+    print("   ✓ get_global_config works")
 
-        dm_cfg = get_data_manager_config()
-        assert dm_cfg['embedding_name'] == 'HuggingFaceEmbeddings'
-        print("   ✓ get_data_manager_config works")
+    services_cfg = get_services_config()
+    assert services_cfg['chat_app']['agent_class'] == 'QAPipeline'
+    print("   ✓ get_services_config works")
 
-        archi_cfg = get_archi_config()
-        assert 'QAPipeline' in archi_cfg['pipelines']
-        print("   ✓ get_archi_config works")
-    
-    # Clean up env
-    if 'ARCHI_CONFIGS_PATH' in os.environ:
-        del os.environ['ARCHI_CONFIGS_PATH']
+    dm_cfg = get_data_manager_config()
+    assert dm_cfg['embedding_name'] == 'HuggingFaceEmbeddings'
+    print("   ✓ get_data_manager_config works")
+
+    archi_cfg = get_archi_config()
+    assert archi_cfg == {}
+    print("   ✓ get_archi_config works")
+
     _clear_factory()
-    
-    print("[1/5] PASSED ✓")
+    print("[1/4] PASSED ✓")
 
 
 def test_prompt_service():
@@ -171,62 +184,7 @@ def test_prompt_service():
         assert service.get('chat', 'default') is not None
         print("   ✓ reload works")
     
-    print("[2/5] PASSED ✓")
-
-
-def test_model_registry():
-    """Test ModelRegistry structure."""
-    print("\n[3/5] Testing ModelRegistry...")
-    
-    # Model imports trigger pipeline imports which call load_global_config()
-    # at module load time, so we need a valid config directory
-    with tempfile.TemporaryDirectory() as tmpdir:
-        os.environ['ARCHI_CONFIGS_PATH'] = tmpdir
-        
-        # Create a minimal config for imports to succeed
-        config = {
-            'name': 'test',
-            'global': {'DATA_PATH': '/tmp/data', 'verbosity': 3, 'ROLES': ['User', 'AI']},
-            'services': {'postgres': {'host': 'localhost'}},
-            'data_manager': {'embedding_name': 'HuggingFaceEmbeddings'},
-            'archi': {'pipelines': ['QAPipeline'], 'model_class_map': {}}
-        }
-        with open(os.path.join(tmpdir, 'test.yaml'), 'w') as f:
-            yaml.dump(config, f)
-        
-        try:
-            from src.archi.models.registry import ModelRegistry, EmbeddingRegistry
-            
-            # Force registry initialization (it's lazy)
-            ModelRegistry._ensure_initialized()
-            EmbeddingRegistry._ensure_initialized()
-            
-            # Test ModelRegistry has expected models
-            expected_models = ['DumbLLM', 'OpenAILLM', 'AnthropicLLM', 'OllamaInterface']
-            for model in expected_models:
-                assert model in ModelRegistry._models, f"Missing {model}"
-            print(f"   ✓ ModelRegistry has {len(ModelRegistry._models)} registered models")
-            
-            # Test get method (lazy loading)
-            dumb_class = ModelRegistry.get('DumbLLM')
-            assert dumb_class is not None
-            print("   ✓ ModelRegistry.get works for DumbLLM")
-            
-            # Test EmbeddingRegistry
-            expected_embeddings = ['HuggingFaceEmbeddings', 'OpenAIEmbeddings']
-            for emb in expected_embeddings:
-                assert emb in EmbeddingRegistry._embeddings, f"Missing {emb}"
-            print(f"   ✓ EmbeddingRegistry has {len(EmbeddingRegistry._embeddings)} registered embeddings")
-            
-            print("[3/5] PASSED ✓")
-            
-        except ImportError as e:
-            print(f"   ⚠ Skipping: Missing optional dependency ({e})")
-            print("[3/5] SKIPPED (missing deps)")
-        finally:
-            if 'ARCHI_CONFIGS_PATH' in os.environ:
-                del os.environ['ARCHI_CONFIGS_PATH']
-            _clear_factory()
+    print("[2/3] PASSED ✓")
 
 
 def test_config_service_dataclasses():
@@ -339,13 +297,22 @@ def test_integration_flow():
             'global': {'DATA_PATH': '/tmp/data', 'verbosity': 3},
             'services': {
                 'postgres': {'host': 'localhost', 'port': 5432, 'database': 'archi'},
-                'chat_app': {'pipeline': 'QAPipeline'}
+                'chat_app': {
+                    'agent_class': 'QAPipeline',
+                    'default_provider': 'local',
+                    'default_model': 'qwen3:4b',
+                    'providers': {
+                        'local': {
+                            'enabled': True,
+                            'base_url': 'http://localhost:11434',
+                            'mode': 'ollama',
+                            'default_model': 'qwen3:4b',
+                            'models': ['qwen3:4b'],
+                        }
+                    },
+                },
             },
             'data_manager': {'embedding_name': 'HuggingFaceEmbeddings'},
-            'archi': {
-                'pipelines': ['QAPipeline'],
-                'model_class_map': {'DumbLLM': {'kwargs': {}}}
-            }
         }
         
         with open(os.path.join(config_dir, 'integration.yaml'), 'w') as f:

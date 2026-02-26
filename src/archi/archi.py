@@ -1,5 +1,5 @@
 import src.archi.pipelines as archiPipelines 
-from src.utils.yaml_config import load_config_with_class_mapping
+from src.utils.config_access import get_full_config
 from src.utils.logging import get_logger
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.utils.vectorstore_connector import VectorstoreConnector
@@ -19,6 +19,8 @@ class archi():
             *args,
             **kwargs
         ):
+        self.pipeline_kwargs = dict(kwargs)
+        self.pipeline_kwargs.pop("config_name", None)
         self.update(pipeline, config_name=kwargs.get("config_name", None))
         self.pipeline_name = pipeline
         self.vs_connector = VectorstoreConnector(self.config)
@@ -29,12 +31,14 @@ class archi():
         Initialize the Pipeline: either passed as argument or from config file.
         """
         logger.debug("Loading config")
-        self.config = load_config_with_class_mapping(name=config_name)
+        # config_name kept for compatibility; currently single active config
+        self.config = get_full_config()
         if pipeline:
             self.pipeline_name=pipeline
         self.pipeline = self._create_pipeline_instance(
             self.pipeline_name,
-            config=self.config
+            config=self.config,
+            **self.pipeline_kwargs,
         )
 
     def _create_pipeline_instance(self, class_name, *args, **kwargs):
@@ -57,7 +61,7 @@ class archi():
     def _prepare_call_kwargs(self, kwargs):
         """Attach a freshly initialised vectorstore to the call kwargs."""
         call_kwargs = dict(kwargs)
-        call_kwargs["vectorstore"] = self.vs_connector.get_vectorstore()
+        call_kwargs["vectorstore"] = self.vs_connector.get_vectorstore() # TODO this probably should just be moved to the specific tool that uses it
         return call_kwargs
 
     def _ensure_pipeline_output(self, result) -> PipelineOutput:

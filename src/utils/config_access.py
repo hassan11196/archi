@@ -1,6 +1,5 @@
 """
 Config access helpers that read from ConfigService / Postgres only.
-No YAML fallback or raw_config usage.
 """
 
 from typing import Any, Dict
@@ -39,22 +38,56 @@ def get_services_config() -> Dict[str, Any]:
     return get_static_config().services_config or {}
 
 
-def get_data_manager_config() -> Dict[str, Any]:
-    return get_static_config().data_manager_config or {}
+def get_data_manager_config(*, resolve_embeddings: bool = False) -> Dict[str, Any]:
+    """
+    Return the data_manager config.
+
+    Set resolve_embeddings=True to map embedding_class_map 'class' entries
+    from string names to actual callables using ConfigService.
+    """
+    static = get_static_config()
+    data_manager = dict(static.data_manager_config or {})
+
+    if resolve_embeddings:
+        try:
+            resolved_map = _config_service().get_embedding_class_map(resolved=True)
+            if resolved_map:
+                data_manager["embedding_class_map"] = resolved_map
+        except Exception:
+            # Leave unresolved; caller can handle if needed
+            pass
+
+    return data_manager
 
 
 def get_archi_config() -> Dict[str, Any]:
     return get_static_config().archi_config or {}
 
 
-def get_full_config() -> Dict[str, Any]:
+def get_full_config(*, resolve_embeddings: bool = False) -> Dict[str, Any]:
+    """
+    Return the full merged config.
+
+    Set resolve_embeddings=True to map embedding_class_map 'class' entries
+    from string names to actual callables using ConfigService.
+    """
     static = get_static_config()
+
+    data_manager_config = dict(static.data_manager_config or {})
+    if resolve_embeddings:
+        try:
+            resolved_map = _config_service().get_embedding_class_map(resolved=True)
+            if resolved_map:
+                data_manager_config["embedding_class_map"] = resolved_map
+        except Exception:
+            pass
+
     return {
         "name": static.deployment_name,
         "config_version": static.config_version,
         "global": static.global_config,
         "services": static.services_config,
-        "data_manager": static.data_manager_config,
+        "data_manager": data_manager_config,
         "archi": static.archi_config,
         "sources": static.sources_config,
         "available_pipelines": static.available_pipelines,

@@ -61,7 +61,7 @@ export const mockData = {
     description: 'A helpful assistant for CMS Computing Operations',
     pipeline: 'CMSCompOpsAgent',
     embedding_name: 'HuggingFaceEmbeddings',
-    data_sources: ['links', 'local_files'],
+    data_sources: ['web', 'local_files'],
   },
 
   providerKeys: {

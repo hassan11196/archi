@@ -14,7 +14,7 @@ Archi is deployed using a Python-based CLI onto containers. It requires:
 Clone the Archi repository:
 
 ```bash
-git clone https://github.com/mit-submit/archi.git
+git clone https://github.com/archi-physics/archi.git
 ```
 
 Check out the latest stable tag (recommended for users; stay on `main` only if you're actively developing):
@@ -43,20 +43,20 @@ The command prints the path to the `archi` executable.
 
 ```bash
 # Clone the repository
-git clone https://github.com/mit-submit/archi.git
+git clone https://github.com/archi-physics/archi.git
 cd archi
-export Archi_DIR=$(pwd)
+export ARCHI_DIR=$(pwd)
 
 # (Optional) Checkout the latest stable tag (recommended for users)
 # Skip this if you're developing and want the tip of main.
 git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
 
 # (Optional) Create and activate a virtual environment
-python3 -m venv .archi_venv
-source .archi_venv/bin/activate
+python3 -m venv archi_venv
+source archi_venv/bin/activate
 
 # Install dependencies
-cd "$Archi_DIR"
+cd "$ARCHI_DIR"
 pip install -e .
 
 # Verify installation

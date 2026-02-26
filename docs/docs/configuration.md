@@ -221,8 +221,6 @@ data_manager:
 
 ## Agent Configuration Model
 
-Archi no longer uses a top-level `archi:` block in standard deployment YAML.
-
 Agent behavior is defined by:
 
 - `services.chat_app.agent_class`: which pipeline class runs (for example `CMSCompOpsAgent`)
@@ -243,6 +241,73 @@ services:
 ```
 
 See [Agents & Tools](agents_tools.md) for agent spec format and tool selection.
+
+---
+
+## `archi`
+
+The `archi` top-level block holds agent-runtime settings such as MCP server definitions.
+
+### `archi.mcp_servers`
+
+Declare external [MCP](https://modelcontextprotocol.io/) servers that agents can use via
+the `mcp` tool name in their agent spec.
+
+```yaml
+archi:
+  mcp_servers:
+    deepwiki:
+      transport: streamable_http
+      url: https://mcp.deepwiki.com/mcp
+    local_tool:
+      transport: stdio
+      command: uvx
+      args:
+        - mcp-server-example
+    legacy_sse:
+      transport: sse
+      url: http://localhost:8080/sse
+      headers:
+        Authorization: "Bearer <token>"
+```
+
+#### Per-server keys
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `transport` | Yes | `stdio`, `sse`, or `streamable_http` (see below) |
+| `url` | For `sse` / `streamable_http` | Full URL of the MCP endpoint |
+| `command` | For `stdio` | Executable that launches the MCP subprocess |
+| `args` | For `stdio` | List of arguments passed to `command` |
+| `headers` | No | HTTP headers sent with every request (`sse` / `streamable_http` only) |
+
+#### Transport values
+
+| Value | Alias(es) accepted | Description |
+|-------|--------------------|-------------|
+| `stdio` | — | Launch a local subprocess and communicate over stdin/stdout |
+| `sse` | — | Connect to a remote server via Server-Sent Events (legacy) |
+| `streamable_http` | `http`, `https`, `streamable-http`, `streamablehttp` | Connect to a remote server via the modern Streamable HTTP protocol |
+
+> **Tip:** `"streamable_http"` is the recommended transport for all remote
+> MCP servers.  Archi automatically normalises the common aliases listed above,
+> so `transport: http` and `transport: streamable-http` both work.
+
+#### DeepWiki quick-start
+
+[DeepWiki](https://deepwiki.com) exposes a free, public MCP server that lets
+the agent ask questions about any public GitHub repository:
+
+```yaml
+archi:
+  mcp_servers:
+    deepwiki:
+      transport: streamable_http
+      url: https://mcp.deepwiki.com/mcp
+```
+
+No API key or account is required.  See [Agents & Tools — DeepWiki MCP Integration](agents_tools.md#deepwiki-mcp-integration)
+and the example deployment at `examples/deployments/deepwiki-agent/config.yaml`.
 
 ---
 

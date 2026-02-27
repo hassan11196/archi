@@ -1,0 +1,60 @@
+# Archi deployment with DeepWiki MCP integration.
+#
+# DeepWiki (https://deepwiki.com) provides AI-powered documentation for any
+# public GitHub repository.  Its official MCP server is hosted at
+# https://mcp.deepwiki.com/mcp and requires no API key or authentication.
+#
+# This example wires the DeepWiki MCP server into Archi so that the agent can
+# answer questions about public GitHub repositories on-the-fly alongside your
+# internal knowledge base.
+#
+# Run with:
+#   archi create --name deepwiki-agent --config examples/deployments/deepwiki-agent/config.yaml --services chatbot --hostmode
+
+name: deepwiki_agent
+
+services:
+  chat_app:
+    agent_class: CMSCompOpsAgent
+    # Point to the directory that contains the DeepWiki-enabled agent spec.
+    agents_dir: examples/agents
+    default_provider: local
+    default_model: llama3.2
+    providers:
+      local:
+        enabled: true
+        base_url: http://localhost:11434
+        mode: ollama
+        default_model: llama3.2
+        models:
+          - llama3.2
+    trained_on: "Internal docs + DeepWiki (public GitHub repos)"
+    port: 7861
+    external_port: 7861
+  vectorstore:
+    backend: postgres
+
+data_manager:
+  embedding_name: HuggingFaceEmbeddings
+  sources:
+    links:
+      input_lists: []   # add your own .list files here
+
+# ---------------------------------------------------------------------------
+# MCP server configuration
+# ---------------------------------------------------------------------------
+# MCP servers declared here are made available to any agent spec that includes
+# "mcp" in its tools list.  The DeepWiki server exposes three tools:
+#
+#   ask_question         – ask a natural-language question about a GitHub repo
+#   read_wiki_structure  – list available wiki sections for a repo
+#   read_wiki_contents   – fetch the text of a specific wiki page
+#
+# Transport: "streamable_http" connects to a remote HTTP MCP endpoint.
+# The DeepWiki server is public, free, and requires no authentication.
+# ---------------------------------------------------------------------------
+archi:
+  mcp_servers:
+    deepwiki:
+      transport: streamable_http
+      url: https://mcp.deepwiki.com/mcp

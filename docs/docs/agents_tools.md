@@ -206,25 +206,69 @@ Archi supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.i
 
 ### Configuration
 
-Define MCP servers in your deployment configuration:
+MCP servers are declared under `archi.mcp_servers` in your deployment config:
 
 ```yaml
-mcp_servers:
-  my_server:
-    transport: "stdio"
-    command: "uvx"
-    args:
-      - "mcp-server-example"
-  web_search:
-    transport: "sse"
-    url: "http://localhost:8080/sse"
+archi:
+  mcp_servers:
+    my_server:
+      transport: "stdio"
+      command: "uvx"
+      args:
+        - "mcp-server-example"
+    web_search:
+      transport: "sse"
+      url: "http://localhost:8080/sse"
+    deepwiki:
+      transport: "streamable_http"
+      url: "https://mcp.deepwiki.com/mcp"
 ```
 
 Each server entry follows the format expected by the `langchain-mcp-adapters` library:
 
-- **`transport`**: Communication method — `"stdio"` (subprocess) or `"sse"` (HTTP Server-Sent Events)
-- **`command`** / **`args`**: For `stdio` transport, the command to launch the server
-- **`url`**: For `sse` transport, the server endpoint
+| Key | Required | Description |
+|-----|----------|-------------|
+| `transport` | Yes | Connection method — see table below |
+| `url` | For `sse` / `streamable_http` | Server endpoint URL |
+| `command` | For `stdio` | Executable to launch the MCP subprocess |
+| `args` | For `stdio` | Arguments passed to `command` |
+| `headers` | Optional | HTTP headers (e.g. `Authorization`) for `sse` / `streamable_http` servers |
+
+#### Supported transports
+
+| `transport` value | Description |
+|-------------------|-------------|
+| `stdio` | Launches a local subprocess and communicates over stdin/stdout |
+| `sse` | Connects to a remote server using Server-Sent Events (legacy; being phased out) |
+| `streamable_http` | Connects to a remote server using the modern Streamable HTTP protocol (recommended for remote servers) |
+
+### DeepWiki MCP Integration
+
+[DeepWiki](https://deepwiki.com) provides AI-powered documentation for any public
+GitHub repository.  Its official MCP server at `https://mcp.deepwiki.com/mcp` is:
+
+- **Free and public** — no account or API key required
+- **No authentication** — connect directly with `streamable_http` transport
+- **Three tools** exposed to the agent:
+
+| Tool | Description |
+|------|-------------|
+| `ask_question` | Ask a natural-language question about any public GitHub repo. Pass `repo_name` as `"owner/repo"` (e.g. `"langchain-ai/langchain"`). |
+| `read_wiki_structure` | List the available wiki sections (table of contents) for a repo. |
+| `read_wiki_contents` | Fetch the full text of a specific wiki page by its path. |
+
+#### Minimal DeepWiki configuration
+
+```yaml
+archi:
+  mcp_servers:
+    deepwiki:
+      transport: streamable_http
+      url: https://mcp.deepwiki.com/mcp
+```
+
+A complete, ready-to-run example is available at
+`examples/deployments/deepwiki-agent/config.yaml`.
 
 ### Agent Spec Example
 
@@ -244,11 +288,15 @@ Use vectorstore search for internal documents and MCP tools for
 external information retrieval.
 ```
 
+A DeepWiki-specific agent spec with usage guidance is provided at
+`examples/agents/deepwiki-research.md`.
+
 ### Runtime Behavior
 
 - MCP sessions are maintained in a background event loop for the lifetime of the service
 - Each MCP tool is wrapped for synchronous execution so it integrates seamlessly with the ReAct agent loop
-- Tool names from MCP servers are namespaced to avoid conflicts with built-in tools
+- Tool names from MCP servers are prefixed with the server name to avoid conflicts with built-in tools
+- Servers that fail to connect at startup are skipped with an error log; the agent continues with any servers that did connect
 
 ---
 

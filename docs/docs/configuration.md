@@ -283,15 +283,11 @@ archi:
 
 #### Transport values
 
-| Value | Alias(es) accepted | Description |
-|-------|--------------------|-------------|
-| `stdio` | — | Launch a local subprocess and communicate over stdin/stdout |
-| `sse` | — | Connect to a remote server via Server-Sent Events (legacy) |
-| `streamable_http` | `http`, `https`, `streamable-http`, `streamablehttp` | Connect to a remote server via the modern Streamable HTTP protocol |
-
-> **Tip:** `"streamable_http"` is the recommended transport for all remote
-> MCP servers.  Archi automatically normalises the common aliases listed above,
-> so `transport: http` and `transport: streamable-http` both work.
+| Value | Description |
+|-------|-------------|
+| `stdio` | Launch a local subprocess and communicate over stdin/stdout |
+| `sse` | Connect to a remote server via Server-Sent Events (legacy) |
+| `streamable_http` | Connect to a remote server via the modern Streamable HTTP protocol |
 
 #### DeepWiki quick-start
 

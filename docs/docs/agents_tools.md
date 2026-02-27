@@ -242,9 +242,6 @@ Each server entry follows the format expected by the `langchain-mcp-adapters` li
 | `sse` | Connects to a remote server using Server-Sent Events (legacy; being phased out) |
 | `streamable_http` | Connects to a remote server using the modern Streamable HTTP protocol (recommended for remote servers) |
 
-> **Aliases:** `"http"`, `"https"`, `"streamable-http"`, and `"streamablehttp"` are
-> all accepted and automatically normalised to `"streamable_http"`.
-
 ### DeepWiki MCP Integration
 
 [DeepWiki](https://deepwiki.com) provides AI-powered documentation for any public

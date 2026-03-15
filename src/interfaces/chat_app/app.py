@@ -2289,6 +2289,12 @@ class FlaskAppWrapper(object):
             require_auth=self.require_auth,
         )
 
+        # MCP SSE endpoint – exposes archi as MCP tools over HTTP+SSE.
+        # Clients connect with just a URL; no local CLI install needed.
+        logger.info("Adding MCP SSE endpoint at /mcp/sse")
+        from src.interfaces.chat_app.mcp_sse import register_mcp_sse
+        register_mcp_sse(self.app, self)
+
         # add unified auth endpoints
         if self.auth_enabled:
             logger.info("Adding unified authentication endpoints")

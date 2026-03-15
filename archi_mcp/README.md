@@ -4,6 +4,15 @@ Expose your [archi](https://github.com/archi-physics/archi) knowledge base as
 **Model Context Protocol (MCP) tools** so that AI assistants in VS Code, Cursor,
 and any other MCP-compatible client can query it directly.
 
+Two transport options are available:
+
+| Transport | How to connect | Requires local install? |
+|---|---|---|
+| **HTTP+SSE** *(built-in)* | Point client at `http://<host>:<port>/mcp/sse` | **No** |
+| **stdio** | Run `archi-mcp` locally | Yes (`pip install "archi[mcp]"`) |
+
+> **Recommended:** use the built-in HTTP+SSE endpoint — no installation needed.
+
 ---
 
 ## What this provides
@@ -19,7 +28,49 @@ and any other MCP-compatible client can query it directly.
 
 ---
 
-## Server setup
+## Option A – Built-in HTTP+SSE endpoint (recommended)
+
+The archi chat service exposes MCP tools directly at `/mcp/sse`.
+No separate process to install or start.
+
+### VS Code (.vscode/mcp.json)
+
+```json
+{
+  "servers": {
+    "archi": {
+      "type": "sse",
+      "url": "http://localhost:7861/mcp/sse"
+    }
+  }
+}
+```
+
+### Cursor (~/.cursor/mcp.json)
+
+```json
+{
+  "mcpServers": {
+    "archi": {
+      "url": "http://localhost:7861/mcp/sse"
+    }
+  }
+}
+```
+
+Replace `localhost:7861` with the public hostname and port of your archi
+deployment when connecting remotely.
+
+Reload the window / restart the editor and the archi tools appear automatically.
+
+---
+
+## Option B – stdio server (archi-mcp CLI)
+
+Use this when you cannot reach the archi service directly over HTTP (e.g. the
+service is behind a firewall and you tunnel to it separately).
+
+### Server setup
 
 ### 1. Install
 
@@ -87,7 +138,7 @@ Without `--config`, settings fall back to environment variables:
 
 ---
 
-## Client setup
+## stdio Client setup
 
 ### VS Code (GitHub Copilot)
 
@@ -159,11 +210,14 @@ Restart Cursor. The archi tools appear under **MCP Tools** in the Composer panel
 
 ---
 
+---
+
 ## Troubleshooting
 
 | Error | Fix |
 |---|---|
-| `mcp package not found` | Run `pip install "archi[mcp]"` |
+| SSE URL not reachable | Confirm the archi chat service is running and the URL is correct |
+| `mcp package not found` (stdio) | Run `pip install "archi[mcp]"` |
 | `Cannot reach archi at http://localhost:7861` | Check `ARCHI_URL` or `services.mcp_server.url`; ensure the chat service is running |
 | `401 Unauthorized` | Set `ARCHI_API_KEY` or `services.mcp_server.api_key` to a valid token |
 | `WARNING: could not read archi config` | Check the path passed to `--config` |

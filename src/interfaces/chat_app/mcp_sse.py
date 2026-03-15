@@ -1,0 +1,499 @@
+"""
+MCP SSE endpoint – exposes archi's RAG capabilities as MCP tools over HTTP+SSE.
+
+AI assistants in VS Code (GitHub Copilot), Cursor, and any other MCP-compatible
+client can connect with just a URL:
+
+    http://<host>:<port>/mcp/sse
+
+No local installation required on the client side.
+
+VS Code  (.vscode/mcp.json):
+    {
+      "servers": {
+        "archi": { "type": "sse", "url": "http://localhost:7861/mcp/sse" }
+      }
+    }
+
+Cursor  (~/.cursor/mcp.json):
+    {
+      "mcpServers": {
+        "archi": { "url": "http://localhost:7861/mcp/sse" }
+      }
+    }
+
+Protocol
+--------
+This implements the MCP SSE transport (JSON-RPC 2.0 over Server-Sent Events):
+
+  1.  Client GETs /mcp/sse  →  receives an SSE stream.
+  2.  Server immediately sends an "endpoint" event with the POST URL:
+          event: endpoint
+          data: /mcp/messages?session_id=<uuid>
+  3.  Client POSTs JSON-RPC messages to /mcp/messages?session_id=<uuid>.
+  4.  Server pushes JSON-RPC responses back via the SSE stream.
+  5.  Keepalive comments (": keepalive") are sent every 30 s to prevent
+      proxies from closing idle connections.
+
+No external ``mcp`` package is required for the SSE transport – the protocol
+is implemented directly in Flask using thread-safe queues.
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import textwrap
+import uuid
+from datetime import datetime, timezone
+from threading import Lock
+from typing import Any, Dict, Optional
+
+from flask import Blueprint, Response, request, stream_with_context
+
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_MCP_VERSION = "2024-11-05"
+_SERVER_INFO = {"name": "archi", "version": "1.0.0"}
+_KEEPALIVE_TIMEOUT = 30  # seconds between keepalive pings
+
+# ---------------------------------------------------------------------------
+# Session registry  (session_id → Queue of outgoing JSON-RPC messages)
+# ---------------------------------------------------------------------------
+
+_sessions: Dict[str, queue.Queue] = {}
+_sessions_lock = Lock()
+
+# ---------------------------------------------------------------------------
+# MCP tool definitions
+# ---------------------------------------------------------------------------
+
+_TOOLS = [
+    {
+        "name": "archi_query",
+        "description": textwrap.dedent("""\
+            Ask a question to the archi RAG (Retrieval-Augmented Generation) system.
+
+            archi retrieves relevant documents from its knowledge base and uses an LLM
+            to compose a grounded answer.  Use this tool when you need information that
+            is stored in the connected archi deployment (documentation, tickets, wiki
+            pages, research papers, course material, etc.).
+
+            You may continue a conversation by passing the conversation_id returned by
+            a previous call.
+        """),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question or request to send to archi.",
+                },
+                "conversation_id": {
+                    "type": "integer",
+                    "description": (
+                        "Optional. Pass the conversation_id from a previous archi_query "
+                        "call to continue the same conversation thread."
+                    ),
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional. Override the LLM provider (e.g. 'openai', 'anthropic').",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional. Override the specific model (e.g. 'gpt-4o').",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "archi_list_documents",
+        "description": textwrap.dedent("""\
+            List the documents that have been indexed into archi's knowledge base.
+
+            Returns a paginated list of document metadata (filename, source type,
+            URL, last updated, etc.).  Use this tool to discover what information
+            archi has access to before querying it, or to find a specific document's
+            hash for use with archi_get_document_content.
+        """),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": "Optional keyword to filter documents by name or URL.",
+                },
+                "source_type": {
+                    "type": "string",
+                    "description": "Optional. Filter by source type: 'web', 'git', 'local', 'jira', etc.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default 50, max 200).",
+                    "default": 50,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset (default 0).",
+                    "default": 0,
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "archi_get_document_content",
+        "description": textwrap.dedent("""\
+            Retrieve the full text content of a document indexed in archi.
+
+            Use archi_list_documents first to obtain a document's hash, then pass
+            it here to read the raw source text that archi ingested.
+        """),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_hash": {
+                    "type": "string",
+                    "description": "The document hash returned by archi_list_documents.",
+                },
+            },
+            "required": ["document_hash"],
+        },
+    },
+    {
+        "name": "archi_get_deployment_info",
+        "description": textwrap.dedent("""\
+            Return configuration and status information about the connected archi
+            deployment.
+
+            Includes the active LLM pipeline and model, retrieval settings (number of
+            documents retrieved, hybrid search weights), embedding model, and the list
+            of available pipelines.  Useful for understanding how archi is configured
+            before issuing queries.
+        """),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "archi_list_agents",
+        "description": textwrap.dedent("""\
+            Return the agent configurations (agent specs) available in this archi
+            deployment.
+
+            Each agent spec defines a name, a system prompt, and the set of tools
+            (retriever, MCP servers, local file search, etc.) that agent can use.
+        """),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "archi_health",
+        "description": (
+            "Check whether the archi deployment is reachable and its database is healthy."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+# ---------------------------------------------------------------------------
+# JSON-RPC helpers
+# ---------------------------------------------------------------------------
+
+
+def _ok(result: Any, rpc_id: Any) -> Dict:
+    return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+
+
+def _err(code: int, message: str, rpc_id: Any) -> Dict:
+    return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+def _text(text: str) -> Dict:
+    """Wrap a string as an MCP tool result."""
+    return {"content": [{"type": "text", "text": str(text)}]}
+
+
+# ---------------------------------------------------------------------------
+# Tool handlers (run inside the Flask process – no HTTP round-trip)
+# ---------------------------------------------------------------------------
+
+
+def _call_tool(name: str, arguments: Dict[str, Any], wrapper) -> Dict:
+    """Dispatch a tools/call request to the appropriate archi internals."""
+    try:
+        if name == "archi_query":
+            return _tool_query(arguments, wrapper)
+        elif name == "archi_list_documents":
+            return _tool_list_documents(arguments, wrapper)
+        elif name == "archi_get_document_content":
+            return _tool_get_document_content(arguments, wrapper)
+        elif name == "archi_get_deployment_info":
+            return _tool_deployment_info(wrapper)
+        elif name == "archi_list_agents":
+            return _tool_list_agents(wrapper)
+        elif name == "archi_health":
+            return _text("status: OK\ndatabase: OK")
+        else:
+            return _text(f"ERROR: Unknown tool '{name}'.")
+    except Exception as exc:
+        logger.exception("MCP tool %s raised an exception", name)
+        return _text(f"ERROR: {exc}")
+
+
+def _tool_query(arguments: Dict[str, Any], wrapper) -> Dict:
+    question = (arguments.get("question") or "").strip()
+    if not question:
+        return _text("ERROR: 'question' is required.")
+
+    conversation_id = arguments.get("conversation_id")
+    client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+
+    response, new_conv_id, _, _, error_code = wrapper.chat(
+        question,
+        conversation_id,
+        client_id,
+        False,    # is_refresh
+        now,      # server_received_msg_ts
+        0.0,      # client_sent_msg_ts  (unknown for MCP callers)
+        120.0,    # client_timeout (seconds)
+        None,     # config_name  (use active config)
+    )
+
+    if error_code is not None:
+        return _text(f"ERROR: chat returned error code {error_code}.")
+
+    parts = [response or ""]
+    if new_conv_id is not None:
+        parts.append(
+            f"\n\n---\n_conversation_id: {new_conv_id} "
+            "(pass this to archi_query to continue the conversation)_"
+        )
+    return _text("".join(parts))
+
+
+def _tool_list_documents(arguments: Dict[str, Any], wrapper) -> Dict:
+    limit = min(int(arguments.get("limit", 50)), 200)
+    offset = int(arguments.get("offset", 0))
+    search: Optional[str] = arguments.get("search") or None
+    source_type: Optional[str] = arguments.get("source_type") or None
+
+    result = wrapper.chat.data_viewer.list_documents(
+        conversation_id=None,
+        source_type=source_type,
+        search=search,
+        enabled_filter=None,
+        limit=limit,
+        offset=offset,
+    )
+    docs = result.get("documents", result.get("items", []))
+    total = result.get("total", len(docs))
+
+    lines = [f"Found {total} document(s) (offset={offset}, limit={limit}):\n"]
+    for doc in docs:
+        display = (
+            doc.get("display_name")
+            or doc.get("filename")
+            or doc.get("url")
+            or doc.get("hash", "unknown")
+        )
+        source = doc.get("source_type", doc.get("type", ""))
+        doc_hash = doc.get("hash", doc.get("id", ""))
+        lines.append(f"  • {display}  [{source}]  hash={doc_hash}")
+
+    lines.append(
+        "\nUse archi_get_document_content(document_hash=<hash>) to read a document."
+    )
+    return _text("\n".join(lines))
+
+
+def _tool_get_document_content(arguments: Dict[str, Any], wrapper) -> Dict:
+    doc_hash = (arguments.get("document_hash") or "").strip()
+    if not doc_hash:
+        return _text("ERROR: 'document_hash' is required.")
+
+    result = wrapper.chat.data_viewer.get_document_content(doc_hash)
+    if result is None:
+        return _text(f"ERROR: Document not found: {doc_hash}")
+
+    content = result.get("content", result.get("text", json.dumps(result, indent=2)))
+    return _text(content)
+
+
+def _tool_deployment_info(wrapper) -> Dict:
+    from src.utils.config_access import get_full_config, get_dynamic_config
+
+    config = get_full_config() or {}
+    services = config.get("services", {})
+    chat_cfg = services.get("chat_app", {})
+    dm_cfg = services.get("data_manager", {})
+
+    try:
+        dynamic = get_dynamic_config()
+    except Exception:
+        dynamic = None
+
+    lines = [
+        f"# archi Deployment: {config.get('name', 'unknown')}",
+        "",
+        "## Active configuration",
+        f"  Pipeline:              {chat_cfg.get('pipeline', 'n/a')}",
+    ]
+    if dynamic:
+        lines += [
+            f"  Model:                 {dynamic.active_model}",
+            f"  Temperature:           {dynamic.temperature}",
+            f"  Max tokens:            {dynamic.max_tokens}",
+            f"  Docs retrieved (k):    {dynamic.num_documents_to_retrieve}",
+            f"  Hybrid search:         {dynamic.use_hybrid_search}",
+            f"    BM25 weight:         {dynamic.bm25_weight}",
+            f"    Semantic weight:     {dynamic.semantic_weight}",
+        ]
+
+    embedding_cfg = dm_cfg.get("embedding", {})
+    lines += [
+        "",
+        "## Embedding",
+        f"  Model:                 {embedding_cfg.get('model', 'n/a')}",
+        f"  Chunk size:            {embedding_cfg.get('chunk_size', 'n/a')}",
+        f"  Chunk overlap:         {embedding_cfg.get('chunk_overlap', 'n/a')}",
+    ]
+    return _text("\n".join(lines))
+
+
+def _tool_list_agents(wrapper) -> Dict:
+    from src.archi.pipelines.agents.agent_spec import (
+        AgentSpecError,
+        list_agent_files,
+        load_agent_spec,
+    )
+
+    agents_dir = wrapper._get_agents_dir()
+    lines = []
+    for path in list_agent_files(agents_dir):
+        try:
+            spec = load_agent_spec(path)
+            tools_str = ", ".join(getattr(spec, "tools", []) or []) or "none"
+            lines.append(f"  • {spec.name}  ({path.name})")
+            lines.append(f"    Tools: {tools_str}")
+        except AgentSpecError:
+            pass
+
+    if not lines:
+        return _text("No agent specs found in this deployment.")
+    return _text("Available agents:\n" + "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _dispatch(body: Dict, session_queue: queue.Queue, wrapper) -> None:
+    """Process one incoming JSON-RPC message and enqueue the response if needed."""
+    rpc_id = body.get("id")
+    method = body.get("method", "")
+    params = body.get("params") or {}
+
+    # Notifications have no id – no response expected.
+    if rpc_id is None:
+        return
+
+    if method == "initialize":
+        response = _ok(
+            {
+                "protocolVersion": _MCP_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": _SERVER_INFO,
+            },
+            rpc_id,
+        )
+    elif method == "tools/list":
+        response = _ok({"tools": _TOOLS}, rpc_id)
+    elif method == "tools/call":
+        result = _call_tool(
+            params.get("name", ""),
+            params.get("arguments") or {},
+            wrapper,
+        )
+        response = _ok(result, rpc_id)
+    elif method == "ping":
+        response = _ok({}, rpc_id)
+    else:
+        response = _err(-32601, f"Method not found: {method}", rpc_id)
+
+    session_queue.put(response)
+
+
+# ---------------------------------------------------------------------------
+# Blueprint factory
+# ---------------------------------------------------------------------------
+
+
+def register_mcp_sse(app, wrapper) -> None:
+    """Register the MCP SSE endpoints on a Flask app.
+
+    Adds two routes:
+      GET  /mcp/sse        – SSE stream (MCP clients connect here)
+      POST /mcp/messages   – JSON-RPC message receiver
+    """
+    mcp = Blueprint("mcp_sse", __name__)
+
+    @mcp.route("/mcp/sse")
+    def sse():
+        """Open an SSE stream for one MCP client session."""
+        session_id = uuid.uuid4().hex
+        q: queue.Queue = queue.Queue()
+        with _sessions_lock:
+            _sessions[session_id] = q
+
+        def generate():
+            # Advertise the POST endpoint to the client.
+            yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
+            try:
+                while True:
+                    try:
+                        msg = q.get(timeout=_KEEPALIVE_TIMEOUT)
+                        if msg is None:
+                            break
+                        yield f"event: message\ndata: {json.dumps(msg)}\n\n"
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+            finally:
+                with _sessions_lock:
+                    _sessions.pop(session_id, None)
+
+        return Response(
+            stream_with_context(generate()),
+            content_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    @mcp.route("/mcp/messages", methods=["POST"])
+    def messages():
+        """Receive a JSON-RPC message from an MCP client."""
+        session_id = request.args.get("session_id", "")
+        with _sessions_lock:
+            q = _sessions.get(session_id)
+        if q is None:
+            return {"error": "unknown or expired session_id"}, 404
+
+        body = request.get_json(silent=True)
+        if not body:
+            return {"error": "request body must be valid JSON"}, 400
+
+        _dispatch(body, q, wrapper)
+        return "", 202
+
+    app.register_blueprint(mcp)
+    logger.info("Registered MCP SSE endpoint at /mcp/sse")

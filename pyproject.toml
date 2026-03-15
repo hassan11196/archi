@@ -29,8 +29,15 @@ dependencies = [
     "psycopg2-binary==2.9.10"
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0",
+    "requests>=2.31.0",
+]
+
 [project.scripts]
 archi = "src.cli.cli_main:main"
+archi-mcp = "archi_mcp.server:main"
 
 [tool.setuptools.package-data]
 "src.cli" = ["templates/**/*"]
@@ -39,7 +46,7 @@ archi = "src.cli.cli_main:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["src*", "archi_mcp*"]
 
 [build-system]
 requires = ["setuptools>=61.0.0"]

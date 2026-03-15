@@ -2362,8 +2362,10 @@ class FlaskAppWrapper(object):
         if not session.get('logged_in'):
             # Preserve all OAuth params so we return here after SSO login.
             session['sso_next'] = request.url
-            if self.sso_enabled:
-                return redirect(url_for('login') + '?method=sso')
+            if self.sso_enabled and self.oauth:
+                # Reuse the existing SSO config directly — no intermediate login page.
+                sso_callback_uri = url_for('sso_callback', _external=True)
+                return self.oauth.sso.authorize_redirect(sso_callback_uri)
             return redirect(url_for('login'))
 
         user_id = session.get('user', {}).get('id')

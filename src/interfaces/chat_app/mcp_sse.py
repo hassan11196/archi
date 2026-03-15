@@ -298,7 +298,7 @@ def _tool_query(arguments: Dict[str, Any], wrapper) -> Dict:
     now = datetime.now(timezone.utc)
 
     response, new_conv_id, _, _, error_code = wrapper.chat(
-        question,
+        [["User", question]],  # same format as last_message from the JS client
         conversation_id,
         client_id,
         False,    # is_refresh

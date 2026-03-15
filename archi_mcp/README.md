@@ -41,7 +41,7 @@ pip install -e ".[mcp]"
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARCHI_URL` | `http://localhost:5000` | Base URL of your archi chat app service. |
+| `ARCHI_URL` | `http://localhost:7861` | Base URL of your archi chat app service. |
 | `ARCHI_API_KEY` | _(none)_ | Bearer token, if archi auth is enabled. |
 | `ARCHI_TIMEOUT` | `120` | HTTP request timeout in seconds. |
 
@@ -74,7 +74,7 @@ Create `.vscode/mcp.json` in your project root:
       "command": "python",
       "args": ["-m", "archi_mcp"],
       "env": {
-        "ARCHI_URL": "http://localhost:5000",
+        "ARCHI_URL": "http://localhost:7861",
         "ARCHI_API_KEY": "",
         "ARCHI_TIMEOUT": "120"
       }
@@ -98,7 +98,7 @@ Open your VS Code user `settings.json` and add:
     "command": "python",
     "args": ["-m", "archi_mcp"],
     "env": {
-      "ARCHI_URL": "http://localhost:5000"
+      "ARCHI_URL": "http://localhost:7861"
     }
   }
 }
@@ -123,7 +123,7 @@ Open **Cursor Settings → MCP** (or edit `~/.cursor/mcp.json`) and add:
       "command": "python",
       "args": ["-m", "archi_mcp"],
       "env": {
-        "ARCHI_URL": "http://localhost:5000",
+        "ARCHI_URL": "http://localhost:7861",
         "ARCHI_API_KEY": "",
         "ARCHI_TIMEOUT": "120"
       }
@@ -181,7 +181,7 @@ Follow-up:   archi_query(question="What hardware does it use?", conversation_id=
 
 | Symptom | Fix |
 |---|---|
-| `Cannot reach archi at http://localhost:5000` | Check `ARCHI_URL`, ensure the chat service is running, and that the port is reachable from where the MCP server runs. |
+| `Cannot reach archi at http://localhost:7861` | Check `ARCHI_URL`, ensure the chat service is running, and that the port is reachable from where the MCP server runs. |
 | `archi returned 401` | Set `ARCHI_API_KEY` to a valid token if archi authentication is enabled. |
 | Tools not visible in VS Code | Reload the VS Code window after editing `mcp.json`. Confirm that `python -m archi_mcp` exits cleanly without errors. |
 | Empty document list | The archi data-manager service may not have finished ingestion yet, or no sources are configured. |

@@ -17,7 +17,7 @@ Or via the installed CLI entry-point:
 
 Configuration via environment variables:
 
-    ARCHI_URL        URL of a running archi deployment (default: http://localhost:5000)
+    ARCHI_URL        URL of a running archi deployment (default: http://localhost:7861)
     ARCHI_API_KEY    Optional bearer token if archi authentication is enabled
     ARCHI_TIMEOUT    HTTP timeout in seconds (default: 120)
 """
@@ -51,7 +51,7 @@ from archi_mcp.client import ArchiClient, ArchiClientError  # noqa: E402  (local
 # ---------------------------------------------------------------------------
 # Server configuration
 # ---------------------------------------------------------------------------
-_DEFAULT_URL = "http://localhost:5000"
+_DEFAULT_URL = "http://localhost:7861"
 _DEFAULT_TIMEOUT = 120
 
 ARCHI_URL: str = os.environ.get("ARCHI_URL", _DEFAULT_URL)

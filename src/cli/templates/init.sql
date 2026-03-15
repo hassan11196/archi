@@ -103,6 +103,21 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
 
+-- Short-lived authorization codes for the OAuth2 PKCE flow used by MCP clients.
+CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+    code VARCHAR(64) PRIMARY KEY,
+    user_id VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_challenge VARCHAR(128) NOT NULL,
+    code_challenge_method VARCHAR(10) NOT NULL DEFAULT 'S256',
+    redirect_uri TEXT NOT NULL,
+    client_id VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes',
+    used BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at);
+
 -- ============================================================================
 -- 2. STATIC CONFIGURATION (Deploy-Time)
 -- ============================================================================

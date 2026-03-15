@@ -1,8 +1,8 @@
 """
 MCP SSE endpoint – exposes archi's RAG capabilities as MCP tools over HTTP+SSE.
 
-AI assistants in VS Code (GitHub Copilot), Cursor, and any other MCP-compatible
-client can connect with just a URL:
+AI assistants in VS Code (GitHub Copilot), Cursor, Claude Desktop, Claude Code,
+and any other MCP-compatible client can connect with just a URL:
 
     http://<host>:<port>/mcp/sse
 
@@ -19,6 +19,23 @@ Cursor  (~/.cursor/mcp.json):
     {
       "mcpServers": {
         "archi": { "url": "http://localhost:7861/mcp/sse" }
+      }
+    }
+
+Claude Desktop  (~/Library/Application Support/Claude/claude_desktop_config.json):
+    {
+      "mcpServers": {
+        "archi": { "type": "sse", "url": "http://localhost:7861/mcp/sse" }
+      }
+    }
+
+Claude Code  (run once in terminal):
+    claude mcp add --transport sse archi http://localhost:7861/mcp/sse
+
+    Or add to .mcp.json in your project root:
+    {
+      "mcpServers": {
+        "archi": { "type": "sse", "url": "http://localhost:7861/mcp/sse" }
       }
     }
 

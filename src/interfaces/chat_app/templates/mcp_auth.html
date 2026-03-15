@@ -46,7 +46,7 @@
       </div>
 
       <h1>MCP Access Token</h1>
-      <p class="subtitle">Use this token to connect VS Code or Cursor to archi's MCP server.</p>
+      <p class="subtitle">Use this token to connect VS Code, Cursor, Claude Desktop, or Claude Code to archi's MCP server.</p>
 
       {% if user %}
       <div class="user-chip">
@@ -82,6 +82,8 @@
         <div class="tab-bar">
           <button class="tab-btn active" onclick="switchTab('vscode', this)">VS Code</button>
           <button class="tab-btn" onclick="switchTab('cursor', this)">Cursor</button>
+          <button class="tab-btn" onclick="switchTab('claude', this)">Claude Desktop</button>
+          <button class="tab-btn" onclick="switchTab('claudecode', this)">Claude Code</button>
         </div>
 
         <div id="tab-vscode" class="tab-content active">
@@ -118,6 +120,52 @@
   }
 }</pre>
           <button class="copy-btn" style="margin-top:10px" onclick="copySnippet('cursor-snippet')">Copy snippet</button>
+        </div>
+
+        <div id="tab-claude" class="tab-content">
+          <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
+            File: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code> (macOS)
+            or <code>%APPDATA%\Claude\claude_desktop_config.json</code> (Windows).
+            Restart Claude Desktop after saving.
+          </p>
+          <pre id="claude-snippet">{
+  "mcpServers": {
+    "archi": {
+      "type": "sse",
+      "url": "{{ mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer {{ token }}"
+      }
+    }
+  }
+}</pre>
+          <button class="copy-btn" style="margin-top:10px" onclick="copySnippet('claude-snippet')">Copy snippet</button>
+        </div>
+
+        <div id="tab-claudecode" class="tab-content">
+          <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
+            Run this once in your terminal to register archi globally. Claude Code stores it in
+            <code>~/.claude.json</code>.
+          </p>
+          <pre id="claudecode-snippet">claude mcp add --transport sse \
+  --header "Authorization: Bearer {{ token }}" \
+  archi {{ mcp_url }}</pre>
+          <button class="copy-btn" style="margin-top:10px" onclick="copySnippet('claudecode-snippet')">Copy command</button>
+          <p style="font-size:0.85rem;color:#555;margin:12px 0 8px">
+            Or add it to <code>.mcp.json</code> in your project root for project-scoped access:
+          </p>
+          <pre id="claudecode-json-snippet">{
+  "mcpServers": {
+    "archi": {
+      "type": "sse",
+      "url": "{{ mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer {{ token }}"
+      }
+    }
+  }
+}</pre>
+          <button class="copy-btn" style="margin-top:10px" onclick="copySnippet('claudecode-json-snippet')">Copy JSON</button>
         </div>
       </div>
 

@@ -9,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, Iterator, List, Optional
 from pathlib import Path
-from urllib.parse import urlparse
+import base64
+import hashlib
+import secrets
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qs, urljoin
 from functools import wraps
 
 import requests
@@ -2345,8 +2348,6 @@ class FlaskAppWrapper(object):
         an auth code is generated, stored in ``mcp_auth_codes``, and the
         browser is redirected back to the client's ``redirect_uri``.
         """
-        import secrets as _secrets
-
         client_id = request.args.get('client_id', '')
         response_type = request.args.get('response_type', '')
         code_challenge = request.args.get('code_challenge', '')
@@ -2370,7 +2371,7 @@ class FlaskAppWrapper(object):
             return jsonify({"error": "server_error", "error_description": "Could not determine user identity"}), 500
 
         # Create a short-lived auth code.
-        code = _secrets.token_hex(32)
+        code = secrets.token_hex(32)
         conn = psycopg2.connect(**self.pg_config)
         try:
             with conn.cursor() as cur:
@@ -2384,18 +2385,16 @@ class FlaskAppWrapper(object):
         finally:
             conn.close()
 
-        from urllib.parse import urlencode
+        # Safely append code (and optional state) to the redirect_uri.
+        parsed = urlparse(redirect_uri)
         params = {"code": code}
         if state:
             params["state"] = state
-        sep = '&' if '?' in redirect_uri else '?'
-        return redirect(redirect_uri + sep + urlencode(params))
+        new_query = urlencode(params) if not parsed.query else parsed.query + '&' + urlencode(params)
+        return redirect(urlunparse(parsed._replace(query=new_query)))
 
     def oauth_token(self):
         """POST /token — OAuth2 token exchange with PKCE verification."""
-        import hashlib as _hashlib
-        import base64 as _base64
-
         grant_type = request.form.get('grant_type', '')
         code = request.form.get('code', '')
         code_verifier = request.form.get('code_verifier', '')
@@ -2405,47 +2404,68 @@ class FlaskAppWrapper(object):
             return jsonify({"error": "invalid_request",
                             "error_description": "grant_type=authorization_code, code, and code_verifier are required"}), 400
 
+        # Verify PKCE before touching the DB.
+        digest = hashlib.sha256(code_verifier.encode()).digest()
+        computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+
         conn = psycopg2.connect(**self.pg_config)
         try:
             with conn.cursor() as cur:
+                # Atomically mark the code as used and return its fields.
+                # This prevents replay attacks without a separate SELECT + UPDATE.
                 cur.execute(
-                    """SELECT user_id, code_challenge, code_challenge_method, redirect_uri, used
-                       FROM mcp_auth_codes
-                       WHERE code = %s AND expires_at > NOW()""",
+                    """UPDATE mcp_auth_codes
+                          SET used = TRUE
+                        WHERE code = %s
+                          AND used = FALSE
+                          AND expires_at > NOW()
+                    RETURNING user_id, code_challenge, redirect_uri""",
                     (code,),
                 )
                 row = cur.fetchone()
                 if not row:
                     return jsonify({"error": "invalid_grant",
-                                    "error_description": "Authorization code is invalid or expired"}), 400
+                                    "error_description": "Authorization code is invalid, expired, or already used"}), 400
 
-                user_id, stored_challenge, challenge_method, stored_redirect, used = row
-                if used:
+                user_id, stored_challenge, stored_redirect = row
+
+                # Validate redirect_uri matches what was used in /authorize.
+                if redirect_uri and redirect_uri != stored_redirect:
                     return jsonify({"error": "invalid_grant",
-                                    "error_description": "Authorization code has already been used"}), 400
+                                    "error_description": "redirect_uri does not match the authorization request"}), 400
 
                 # Verify PKCE: BASE64URL(SHA256(code_verifier)) == code_challenge
-                digest = _hashlib.sha256(code_verifier.encode()).digest()
-                computed = _base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
-                if computed != stored_challenge:
+                if computed_challenge != stored_challenge:
                     return jsonify({"error": "invalid_grant",
                                     "error_description": "code_verifier does not match code_challenge"}), 400
 
-                # Mark code as used.
-                cur.execute("UPDATE mcp_auth_codes SET used = TRUE WHERE code = %s", (code,))
+                # Opportunistically delete expired codes to keep the table tidy.
+                cur.execute("DELETE FROM mcp_auth_codes WHERE expires_at < NOW()")
+
+                # Fetch or create the user's long-lived MCP token in the same
+                # connection to avoid opening extra DB connections.
+                cur.execute(
+                    """SELECT token FROM mcp_tokens
+                       WHERE user_id = %s
+                         AND (expires_at IS NULL OR expires_at > NOW())
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (user_id,),
+                )
+                token_row = cur.fetchone()
+                if token_row:
+                    token = token_row[0]
+                else:
+                    token = secrets.token_hex(32)
+                    cur.execute(
+                        "INSERT INTO mcp_tokens (token, user_id) VALUES (%s, %s)",
+                        (token, user_id),
+                    )
+
             conn.commit()
         finally:
             conn.close()
 
-        # Return the user's long-lived MCP bearer token as the access_token.
-        token = self._get_mcp_token(user_id)
-        if not token:
-            token = self._create_mcp_token(user_id)
-
-        return jsonify({
-            "access_token": token,
-            "token_type": "bearer",
-        })
+        return jsonify({"access_token": token, "token_type": "bearer"})
 
     def _set_user_session(self, email: str, name: str, username: str, user_id: str = '', auth_method: str = 'sso', roles: list = None):
         """Set user session with well-defined structure."""

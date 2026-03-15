@@ -89,6 +89,21 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- ============================================================================
+-- 1.2 MCP API TOKENS (VS Code / Cursor integration)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    token VARCHAR(64) PRIMARY KEY,        -- secrets.token_hex(32)
+    user_id VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT,                    -- e.g. "VS Code – work laptop"
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ                -- NULL = never expires
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
+
+-- ============================================================================
 -- 2. STATIC CONFIGURATION (Deploy-Time)
 -- ============================================================================
 

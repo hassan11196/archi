@@ -2293,7 +2293,12 @@ class FlaskAppWrapper(object):
         # Clients connect with just a URL; no local CLI install needed.
         logger.info("Adding MCP SSE endpoint at /mcp/sse")
         from src.interfaces.chat_app.mcp_sse import register_mcp_sse
-        register_mcp_sse(self.app, self)
+        _mcp_auth_required = self.auth_enabled and self.sso_enabled
+        register_mcp_sse(
+            self.app, self,
+            pg_config=self.pg_config,
+            auth_enabled=_mcp_auth_required,
+        )
 
         # add unified auth endpoints
         if self.auth_enabled:
@@ -2307,6 +2312,8 @@ class FlaskAppWrapper(object):
             
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
+                self.add_endpoint('/mcp/auth', 'mcp_auth', self.mcp_auth, methods=['GET'])
+                self.add_endpoint('/mcp/auth/regenerate', 'mcp_auth_regenerate', self.mcp_auth_regenerate, methods=['POST'])
 
     def _set_user_session(self, email: str, name: str, username: str, user_id: str = '', auth_method: str = 'sso', roles: list = None):
         """Set user session with well-defined structure."""
@@ -2482,7 +2489,12 @@ class FlaskAppWrapper(object):
             )
             
             logger.info(f"SSO login successful for user: {user_email} with roles: {user_roles}")
-            
+
+            # Honour any pending post-login redirect (e.g. /mcp/auth)
+            next_url = session.pop('sso_next', None)
+            if next_url:
+                return redirect(next_url)
+
             # Redirect to main page
             return redirect(url_for('index'))
             
@@ -2497,6 +2509,109 @@ class FlaskAppWrapper(object):
             )
             flash(f"Authentication failed: {str(e)}")
             return redirect(url_for('login'))
+
+    # ------------------------------------------------------------------
+    # MCP token helpers
+    # ------------------------------------------------------------------
+
+    def _get_mcp_token(self, user_id: str) -> Optional[str]:
+        """Return the existing MCP token for a user, or None."""
+        import secrets as _secrets
+        conn = psycopg2.connect(**self.pg_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT token FROM mcp_tokens
+                       WHERE user_id = %s
+                         AND (expires_at IS NULL OR expires_at > NOW())
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.close()
+
+    def _create_mcp_token(self, user_id: str) -> str:
+        """Create and store a new MCP token for a user, returning the token string."""
+        import secrets as _secrets
+        token = _secrets.token_hex(32)
+        conn = psycopg2.connect(**self.pg_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO mcp_tokens (token, user_id) VALUES (%s, %s)",
+                    (token, user_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return token
+
+    def _rotate_mcp_token(self, user_id: str) -> str:
+        """Delete all existing MCP tokens for a user and create a fresh one."""
+        import secrets as _secrets
+        token = _secrets.token_hex(32)
+        conn = psycopg2.connect(**self.pg_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM mcp_tokens WHERE user_id = %s", (user_id,))
+                cur.execute(
+                    "INSERT INTO mcp_tokens (token, user_id) VALUES (%s, %s)",
+                    (token, user_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return token
+
+    # ------------------------------------------------------------------
+    # MCP auth page
+    # ------------------------------------------------------------------
+
+    def mcp_auth(self):
+        """Show the MCP token page.
+
+        Requires SSO login.  If the user is not logged in they are
+        redirected to the SSO provider; after login the SSO callback
+        returns them here via ``session['sso_next']``.
+        """
+        if not session.get('logged_in'):
+            session['sso_next'] = '/mcp/auth'
+            return redirect(url_for('login') + '?method=sso')
+
+        user_info = session.get('user', {})
+        user_id = user_info.get('id')
+        if not user_id:
+            flash("Could not determine your user identity. Please log in again.")
+            return redirect(url_for('login'))
+
+        token = self._get_mcp_token(user_id)
+        if not token:
+            token = self._create_mcp_token(user_id)
+
+        mcp_url = request.host_url.rstrip('/') + '/mcp/sse'
+        regenerated = request.args.get('regenerated') == '1'
+
+        return render_template(
+            'mcp_auth.html',
+            token=token,
+            mcp_url=mcp_url,
+            user=user_info,
+            regenerated=regenerated,
+        )
+
+    def mcp_auth_regenerate(self):
+        """Rotate the user's MCP token (POST /mcp/auth/regenerate)."""
+        if not session.get('logged_in'):
+            return jsonify({'error': 'Authentication required'}), 401
+
+        user_id = session.get('user', {}).get('id')
+        if not user_id:
+            return jsonify({'error': 'Could not determine user identity'}), 400
+
+        self._rotate_mcp_token(user_id)
+        return redirect(url_for('mcp_auth') + '?regenerated=1')
 
     def get_user(self):
         """API endpoint to get current user information including roles and permissions"""

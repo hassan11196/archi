@@ -49,7 +49,8 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, Response, request, stream_with_context
+import psycopg2
+from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 from src.utils.logging import get_logger
 
@@ -64,11 +65,52 @@ _SERVER_INFO = {"name": "archi", "version": "1.0.0"}
 _KEEPALIVE_TIMEOUT = 30  # seconds between keepalive pings
 
 # ---------------------------------------------------------------------------
-# Session registry  (session_id → Queue of outgoing JSON-RPC messages)
+# Session registry  (session_id → {"queue": Queue, "user_id": str|None})
 # ---------------------------------------------------------------------------
 
-_sessions: Dict[str, queue.Queue] = {}
+_sessions: Dict[str, Dict] = {}
 _sessions_lock = Lock()
+
+
+# ---------------------------------------------------------------------------
+# Token validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_mcp_token(token: str, pg_config: dict) -> Optional[str]:
+    """Validate an MCP bearer token and return the user_id, or None if invalid."""
+    if not token or not pg_config:
+        return None
+    try:
+        conn = psycopg2.connect(**pg_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id FROM mcp_tokens
+                       WHERE token = %s
+                         AND (expires_at IS NULL OR expires_at > NOW())""",
+                    (token,),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        "UPDATE mcp_tokens SET last_used_at = NOW() WHERE token = %s",
+                        (token,),
+                    )
+                    conn.commit()
+                    return row[0]
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("Error validating MCP token")
+    return None
+
+
+def _extract_bearer_token(req) -> Optional[str]:
+    auth_header = req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:].strip()
+    return None
 
 # ---------------------------------------------------------------------------
 # MCP tool definitions
@@ -436,22 +478,56 @@ def _dispatch(body: Dict, session_queue: queue.Queue, wrapper) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register_mcp_sse(app, wrapper) -> None:
+def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = False) -> None:
     """Register the MCP SSE endpoints on a Flask app.
 
-    Adds two routes:
+    Adds routes:
       GET  /mcp/sse        – SSE stream (MCP clients connect here)
       POST /mcp/messages   – JSON-RPC message receiver
+
+    When ``auth_enabled`` is True, both endpoints require an
+    ``Authorization: Bearer <mcp-token>`` header.  Tokens are issued via
+    the ``/mcp/auth`` page after the user logs in through SSO.
     """
     mcp = Blueprint("mcp_sse", __name__)
+
+    def _auth_check():
+        """Return (user_id, error_response) tuple.  error_response is None on success."""
+        if not auth_enabled:
+            return None, None
+        token = _extract_bearer_token(request)
+        if not token:
+            resp = jsonify({
+                "error": "unauthorized",
+                "message": "MCP access requires a bearer token. "
+                           "Visit /mcp/auth to generate one after logging in.",
+                "login_url": "/mcp/auth",
+            })
+            resp.status_code = 401
+            return None, resp
+        user_id = _validate_mcp_token(token, pg_config)
+        if not user_id:
+            resp = jsonify({
+                "error": "invalid_token",
+                "message": "The bearer token is invalid or has expired. "
+                           "Visit /mcp/auth to generate a new token.",
+                "login_url": "/mcp/auth",
+            })
+            resp.status_code = 401
+            return None, resp
+        return user_id, None
 
     @mcp.route("/mcp/sse")
     def sse():
         """Open an SSE stream for one MCP client session."""
+        user_id, err = _auth_check()
+        if err is not None:
+            return err
+
         session_id = uuid.uuid4().hex
         q: queue.Queue = queue.Queue()
         with _sessions_lock:
-            _sessions[session_id] = q
+            _sessions[session_id] = {"queue": q, "user_id": user_id}
 
         def generate():
             # Advertise the POST endpoint to the client.
@@ -482,11 +558,17 @@ def register_mcp_sse(app, wrapper) -> None:
     @mcp.route("/mcp/messages", methods=["POST"])
     def messages():
         """Receive a JSON-RPC message from an MCP client."""
+        _, err = _auth_check()
+        if err is not None:
+            return err
+
         session_id = request.args.get("session_id", "")
         with _sessions_lock:
-            q = _sessions.get(session_id)
-        if q is None:
+            session_entry = _sessions.get(session_id)
+        if session_entry is None:
             return {"error": "unknown or expired session_id"}, 404
+
+        q = session_entry["queue"]
 
         body = request.get_json(silent=True)
         if not body:
@@ -496,4 +578,7 @@ def register_mcp_sse(app, wrapper) -> None:
         return "", 202
 
     app.register_blueprint(mcp)
-    logger.info("Registered MCP SSE endpoint at /mcp/sse")
+    if auth_enabled:
+        logger.info("Registered MCP SSE endpoint at /mcp/sse (auth required – Bearer token)")
+    else:
+        logger.info("Registered MCP SSE endpoint at /mcp/sse (no auth)")

@@ -15,7 +15,14 @@ Or via the installed CLI entry-point:
 
     archi-mcp
 
-Configuration via environment variables:
+Point at an archi config file so settings are read automatically:
+
+    archi-mcp --config ~/.archi/archi-mydeployment/configs/chat-config.yaml
+
+Configuration (in order of precedence: CLI flag > env var > archi config > default):
+
+    --config         Path to a rendered archi config YAML file.
+                     Reads services.mcp_server.{url,api_key,timeout}.
 
     ARCHI_URL        URL of a running archi deployment (default: http://localhost:7861)
     ARCHI_API_KEY    Optional bearer token if archi authentication is enabled
@@ -24,6 +31,7 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -54,9 +62,48 @@ from archi_mcp.client import ArchiClient, ArchiClientError  # noqa: E402  (local
 _DEFAULT_URL = "http://localhost:7861"
 _DEFAULT_TIMEOUT = 120
 
-ARCHI_URL: str = os.environ.get("ARCHI_URL", _DEFAULT_URL)
-ARCHI_API_KEY: Optional[str] = os.environ.get("ARCHI_API_KEY")
-ARCHI_TIMEOUT: int = int(os.environ.get("ARCHI_TIMEOUT", str(_DEFAULT_TIMEOUT)))
+
+def _load_archi_config(config_path: str) -> Dict[str, Any]:
+    """Load services.mcp_server settings from a rendered archi config YAML."""
+    try:
+        import yaml  # PyYAML is already a core archi dependency
+    except ImportError:
+        return {}
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("services", {}).get("mcp_server", {})
+    except Exception as exc:
+        print(f"WARNING: could not read archi config {config_path!r}: {exc}", file=sys.stderr)
+        return {}
+
+
+def _resolve_config(config_path: Optional[str]) -> tuple:
+    """Return (url, api_key, timeout) by merging archi config, env vars, and defaults."""
+    file_cfg: Dict[str, Any] = _load_archi_config(config_path) if config_path else {}
+
+    url = (
+        os.environ.get("ARCHI_URL")
+        or file_cfg.get("url")
+        or _DEFAULT_URL
+    )
+    api_key = (
+        os.environ.get("ARCHI_API_KEY")
+        or file_cfg.get("api_key")
+        or None
+    )
+    timeout_raw = (
+        os.environ.get("ARCHI_TIMEOUT")
+        or file_cfg.get("timeout")
+        or _DEFAULT_TIMEOUT
+    )
+    return url, api_key, int(timeout_raw)
+
+
+# Resolved at startup (may be overridden by main() after arg parsing)
+ARCHI_URL: str = _DEFAULT_URL
+ARCHI_API_KEY: Optional[str] = None
+ARCHI_TIMEOUT: int = _DEFAULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # MCP Server setup
@@ -431,6 +478,28 @@ async def _run() -> None:
 def main() -> None:
     """CLI entry point: archi-mcp"""
     import asyncio
+
+    global ARCHI_URL, ARCHI_API_KEY, ARCHI_TIMEOUT, _client
+
+    parser = argparse.ArgumentParser(
+        prog="archi-mcp",
+        description="archi MCP server – expose your archi knowledge base as MCP tools.",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a rendered archi config YAML file "
+            "(e.g. ~/.archi/archi-mydeployment/configs/chat-config.yaml). "
+            "Reads services.mcp_server.{url,api_key,timeout}. "
+            "Environment variables take precedence over file values."
+        ),
+    )
+    args = parser.parse_args()
+
+    ARCHI_URL, ARCHI_API_KEY, ARCHI_TIMEOUT = _resolve_config(args.config)
+    _client = None  # reset so _get_client() picks up new values
 
     print(
         f"Starting archi MCP server (archi URL: {ARCHI_URL})",

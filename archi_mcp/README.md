@@ -1,9 +1,8 @@
 # archi MCP Server
 
-Expose your [archi](https://github.com/archi-physics/archi) knowledge base as a set of
-**Model Context Protocol (MCP) tools** so that AI assistants in
-[VS Code](https://code.visualstudio.com/), [Cursor](https://cursor.sh/), and any other
-MCP-compatible client can query it directly.
+Expose your [archi](https://github.com/archi-physics/archi) knowledge base as
+**Model Context Protocol (MCP) tools** so that AI assistants in VS Code, Cursor,
+and any other MCP-compatible client can query it directly.
 
 ---
 
@@ -11,177 +10,160 @@ MCP-compatible client can query it directly.
 
 | Tool | Description |
 |---|---|
-| `archi_query` | Ask archi a question. Uses the active RAG pipeline to retrieve relevant documents and compose a grounded answer. Supports multi-turn conversation. |
-| `archi_list_documents` | List documents indexed in archi's knowledge base (filterable by keyword or source type). |
-| `archi_get_document_content` | Read the full text of a specific indexed document. |
-| `archi_get_deployment_info` | Show the active pipeline, model, retrieval settings, and available providers. |
-| `archi_list_agents` | List available agent configurations (agent specs). |
-| `archi_health` | Check that the archi deployment is reachable and its database is connected. |
+| `archi_query` | Ask a question via archi's active RAG pipeline |
+| `archi_list_documents` | Browse the indexed knowledge base |
+| `archi_get_document_content` | Read the full text of an indexed document |
+| `archi_get_deployment_info` | Show active pipeline, model, and retrieval config |
+| `archi_list_agents` | List available agent specs |
+| `archi_health` | Verify the deployment is reachable |
 
 ---
 
-## Prerequisites
+## Server setup
 
-1. A running archi deployment (the chat app service must be reachable).
-2. Python 3.9+ with the `mcp` package installed.
+### 1. Install
 
 ```bash
-pip install "mcp>=1.0.0"
+pip install "archi[mcp]"
 ```
 
-Or install directly from the archi repo:
+Or, in development (from the repo root):
 
 ```bash
 pip install -e ".[mcp]"
 ```
 
----
+### 2. Configure archi
 
-## Environment variables
+Add an `mcp_server` block to your archi deployment config YAML.  The defaults
+work for a local deployment on the standard port:
+
+```yaml
+services:
+  chat_app:
+    port: 7861
+    external_port: 7861
+    hostname: localhost        # or your public hostname / domain
+
+  mcp_server:
+    enabled: true
+    # Public URL that MCP clients will connect to.
+    # Defaults to http://<chat_app.hostname>:<chat_app.external_port>
+    url: "http://localhost:7861"
+    # Set this if chat app auth is enabled (services.chat_app.auth.enabled: true).
+    api_key: ""
+    # HTTP request timeout in seconds.
+    timeout: 120
+```
+
+Redeploy so the rendered config picks up the new block:
+
+```bash
+archi restart --name <deployment-name> --service chatbot
+```
+
+The rendered config lands at:
+
+```
+~/.archi/archi-<name>/configs/chat-config.yaml
+```
+
+### 3. Start the MCP server
+
+Point `archi-mcp` at the rendered config so it reads `services.mcp_server.*`
+automatically:
+
+```bash
+archi-mcp --config ~/.archi/archi-<name>/configs/chat-config.yaml
+```
+
+Without `--config`, settings fall back to environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARCHI_URL` | `http://localhost:7861` | Base URL of your archi chat app service. |
-| `ARCHI_API_KEY` | _(none)_ | Bearer token, if archi auth is enabled. |
-| `ARCHI_TIMEOUT` | `120` | HTTP request timeout in seconds. |
+| `ARCHI_URL` | `http://localhost:7861` | Base URL of the archi chat service |
+| `ARCHI_API_KEY` | *(none)* | Bearer token when auth is enabled |
+| `ARCHI_TIMEOUT` | `120` | HTTP timeout in seconds |
 
 ---
 
-## Running the server manually
+## Client setup
 
-```bash
-ARCHI_URL=http://your-archi-host:5000 python -m archi_mcp
-# or
-ARCHI_URL=http://your-archi-host:5000 archi-mcp
-```
+### VS Code (GitHub Copilot)
 
-The server uses **stdio transport** (stdin/stdout), which is the standard transport
-used by VS Code and Cursor.
-
----
-
-## VS Code setup
-
-### Option A — `.vscode/mcp.json` (workspace-scoped, recommended)
-
-Create `.vscode/mcp.json` in your project root:
+Create or edit `.vscode/mcp.json` in your workspace:
 
 ```json
 {
   "servers": {
     "archi": {
       "type": "stdio",
-      "command": "python",
-      "args": ["-m", "archi_mcp"],
+      "command": "archi-mcp",
+      "args": ["--config", "${env:HOME}/.archi/archi-mydeployment/configs/chat-config.yaml"]
+    }
+  }
+}
+```
+
+To use environment variables instead:
+
+```json
+{
+  "servers": {
+    "archi": {
+      "type": "stdio",
+      "command": "archi-mcp",
       "env": {
         "ARCHI_URL": "http://localhost:7861",
-        "ARCHI_API_KEY": "",
-        "ARCHI_TIMEOUT": "120"
+        "ARCHI_API_KEY": "optional-token"
       }
     }
   }
 }
 ```
 
-> **Tip:** Set `ARCHI_URL` to the address of your archi chat app service.
-> If archi runs in a container, use `http://localhost:<host-port>` where
-> `<host-port>` is the port mapped to the container's chat service.
+Reload the window (`Ctrl+Shift+P` → **Developer: Reload Window**) and the
+archi tools appear in GitHub Copilot's tool picker.
 
-### Option B — User settings (`settings.json`)
+### Cursor
 
-Open your VS Code user `settings.json` and add:
-
-```json
-"github.copilot.chat.mcp.servers": {
-  "archi": {
-    "type": "stdio",
-    "command": "python",
-    "args": ["-m", "archi_mcp"],
-    "env": {
-      "ARCHI_URL": "http://localhost:7861"
-    }
-  }
-}
-```
-
-### Verifying in VS Code
-
-1. Open the GitHub Copilot Chat panel.
-2. Click the **Tools** button (plug icon).
-3. You should see the six `archi_*` tools listed and enabled.
-
----
-
-## Cursor setup
-
-Open **Cursor Settings → MCP** (or edit `~/.cursor/mcp.json`) and add:
+Edit `~/.cursor/mcp.json` (create it if it doesn't exist):
 
 ```json
 {
   "mcpServers": {
     "archi": {
-      "command": "python",
-      "args": ["-m", "archi_mcp"],
+      "command": "archi-mcp",
+      "args": ["--config", "/home/you/.archi/archi-mydeployment/configs/chat-config.yaml"]
+    }
+  }
+}
+```
+
+Or with environment variables:
+
+```json
+{
+  "mcpServers": {
+    "archi": {
+      "command": "archi-mcp",
       "env": {
-        "ARCHI_URL": "http://localhost:7861",
-        "ARCHI_API_KEY": "",
-        "ARCHI_TIMEOUT": "120"
+        "ARCHI_URL": "http://localhost:7861"
       }
     }
   }
 }
 ```
 
-Then restart Cursor. The archi tools appear in the **Composer** tool list.
-
----
-
-## Other MCP clients
-
-The server uses the standard **stdio** transport, so it works with any MCP-compatible
-client that can launch a subprocess. Point the client at:
-
-```
-command: python -m archi_mcp
-env:     ARCHI_URL=http://<your-archi-host>:<port>
-```
-
----
-
-## Example usage
-
-Once configured, you can ask your AI assistant:
-
-> _"Use archi to find documentation about the GPU cluster submission process."_
-
-> _"Query archi: what are the memory limits for batch jobs?"_
-
-> _"List the documents archi has indexed, then show me the content of the SLURM guide."_
-
-The assistant will invoke the appropriate `archi_*` tool and incorporate the retrieved
-information into its response.
-
----
-
-## Multi-turn conversations
-
-`archi_query` returns a `conversation_id`. Pass it back to continue the thread:
-
-```
-First call:  archi_query(question="What is SubMIT?")
-             → answer + conversation_id: 42
-
-Follow-up:   archi_query(question="What hardware does it use?", conversation_id=42)
-             → answer with context from the previous exchange
-```
+Restart Cursor. The archi tools appear under **MCP Tools** in the Composer panel.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Fix |
+| Error | Fix |
 |---|---|
-| `Cannot reach archi at http://localhost:7861` | Check `ARCHI_URL`, ensure the chat service is running, and that the port is reachable from where the MCP server runs. |
-| `archi returned 401` | Set `ARCHI_API_KEY` to a valid token if archi authentication is enabled. |
-| Tools not visible in VS Code | Reload the VS Code window after editing `mcp.json`. Confirm that `python -m archi_mcp` exits cleanly without errors. |
-| Empty document list | The archi data-manager service may not have finished ingestion yet, or no sources are configured. |
+| `mcp package not found` | Run `pip install "archi[mcp]"` |
+| `Cannot reach archi at http://localhost:7861` | Check `ARCHI_URL` or `services.mcp_server.url`; ensure the chat service is running |
+| `401 Unauthorized` | Set `ARCHI_API_KEY` or `services.mcp_server.api_key` to a valid token |
+| `WARNING: could not read archi config` | Check the path passed to `--config` |

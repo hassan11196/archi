@@ -350,7 +350,7 @@ def _tool_query(
         answer_parts: list[str] = []
         new_conv_id = None
 
-        for event in wrapper.stream(
+        for event in wrapper.chat.stream(
             [["User", question]],
             conversation_id,
             client_id,

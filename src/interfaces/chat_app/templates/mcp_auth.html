@@ -131,11 +131,13 @@
           <pre id="claude-snippet">{
   "mcpServers": {
     "archi": {
-      "type": "sse",
-      "url": "{{ mcp_url }}",
-      "headers": {
-        "Authorization": "Bearer {{ token }}"
-      }
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "{{ mcp_url }}",
+        "--header",
+        "Authorization: Bearer {{ token }}"
+      ]
     }
   }
 }</pre>

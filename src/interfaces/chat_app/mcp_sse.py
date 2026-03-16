@@ -25,7 +25,15 @@ Cursor  (~/.cursor/mcp.json):
 Claude Desktop  (~/Library/Application Support/Claude/claude_desktop_config.json):
     {
       "mcpServers": {
-        "archi": { "type": "sse", "url": "http://localhost:7861/mcp/sse" }
+                "archi": {
+                    "command": "npx",
+                    "args": [
+                        "mcp-remote",
+                        "http://localhost:7861/mcp/sse",
+                        "--header",
+                        "Authorization: Bearer <TOKEN>"
+                    ]
+                }
       }
     }
 
@@ -319,9 +327,9 @@ def _tool_query(arguments: Dict[str, Any], wrapper) -> Dict:
         conversation_id,
         client_id,
         False,    # is_refresh
-        now,      # server_received_msg_ts
-        0.0,      # client_sent_msg_ts  (unknown for MCP callers)
-        120.0,    # client_timeout (seconds)
+        now,              # server_received_msg_ts
+        now.timestamp(),  # client_sent_msg_ts
+        120.0,            # client_timeout (seconds)
         None,     # config_name  (use active config)
     )
 

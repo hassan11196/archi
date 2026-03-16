@@ -278,6 +278,19 @@ class BaseReActAgent:
                 latest_messages=[],
                 agent_inputs=agent_inputs,
             )
+        except Exception as exc:
+            if not self._is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context window overflow in %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            return self._handle_context_overflow(
+                error=exc,
+                agent_inputs=agent_inputs,
+                latest_messages=[],
+            )
 
     def stream(self, **kwargs) -> Iterator[PipelineOutput]:
         """Stream agent updates synchronously with structured trace events."""
@@ -467,7 +480,7 @@ class BaseReActAgent:
             if not self._is_context_overflow_error(exc):
                 raise
             logger.warning(
-                "Context overflow during stream for %s: %s",
+                "Context window overflow during stream for %s: %s",
                 self.__class__.__name__,
                 exc,
             )
@@ -739,7 +752,7 @@ class BaseReActAgent:
             if not self._is_context_overflow_error(exc):
                 raise
             logger.warning(
-                "Context overflow during async stream for %s: %s",
+                "Context window overflow during async stream for %s: %s",
                 self.__class__.__name__,
                 exc,
             )
@@ -1662,9 +1675,15 @@ class BaseReActAgent:
             input_messages = agent_inputs.get("messages") or []
         user_question = self._last_user_message_content(messages or input_messages) or "Unavailable"
 
+        is_context_overflow = recursion_limit == 0
+        max_snippet_chars = 2000  # Prevent wrap-up prompt from being too large
+
         conversation_snippets = []
         for msg in messages[-6:]:
-            conversation_snippets.append(f"- {self._format_message(msg)}")
+            formatted = self._format_message(msg)
+            if len(formatted) > max_snippet_chars:
+                formatted = formatted[:max_snippet_chars] + "... [truncated]"
+            conversation_snippets.append(f"- {formatted}")
 
         memory = self.active_memory
         notes = memory.intermediate_steps() if memory else []
@@ -1681,13 +1700,35 @@ class BaseReActAgent:
                 snippet = (doc.page_content or "")[:400]
                 document_summaries.append(f"- {location}: {snippet}")
 
-        prompt_sections: List[str] = [
-            (
+        if is_context_overflow:
+            preamble = (
+                "You are finalizing an interrupted ReAct agent run. The context window was exceeded "
+                "and the agent can no longer call tools. Provide one concise wrap-up response: "
+                "summarize what was attempted, cite retrieved evidence briefly, and answer the user's request "
+                "as best as possible. Do NOT call tools."
+            )
+            closing = (
+                "Respond with:\n"
+                "1) Brief summary of what was attempted.\n"
+                "2) Best possible answer using the above context.\n"
+                "3) Explicitly note that the run stopped due to context window overflow."
+            )
+        else:
+            preamble = (
                 "You are finalizing an interrupted ReAct agent run. The graph hit its recursion limit "
                 f"({recursion_limit}) and can no longer call tools. Provide one concise wrap-up response: "
                 "summarize what was attempted, cite retrieved evidence briefly, and answer the user's request "
                 "as best as possible. Do NOT call tools."
-            ),
+            )
+            closing = (
+                "Respond with:\n"
+                "1) Brief summary of what was attempted.\n"
+                "2) Best possible answer using the above context.\n"
+                f"3) Explicitly note that the run stopped after hitting the recursion limit {recursion_limit}."
+            )
+
+        prompt_sections: List[str] = [
+            preamble,
             f"User request or latest message:\n{user_question}",
         ]
         if conversation_snippets:
@@ -1698,11 +1739,7 @@ class BaseReActAgent:
             prompt_sections.append("Retrieved documents (truncated):\n" + "\n".join(document_summaries))
         error_text = str(error) if error else ""
         if error_text:
-            prompt_sections.append(f"Error detail: {error_text}")
-        prompt_sections.append(
-            "Respond with:\n"
-            "1) Brief summary of what was attempted.\n"
-            "2) Best possible answer using the above context.\n"
-            f"3) Explicitly note that the run stopped after hitting the recursion limit {recursion_limit}."
-        )
+            error_snippet = error_text[:500] if len(error_text) > 500 else error_text
+            prompt_sections.append(f"Error detail: {error_snippet}")
+        prompt_sections.append(closing)
         return "\n\n".join(prompt_sections)

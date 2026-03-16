@@ -2316,6 +2316,7 @@ class FlaskAppWrapper(object):
                 auth_enabled=_mcp_auth_required,
             )
             self.add_endpoint('/.well-known/oauth-authorization-server', 'oauth_metadata', self.oauth_metadata, methods=['GET'])
+            self.add_endpoint('/.well-known/oauth-protected-resource', 'oauth_protected_resource', self.oauth_protected_resource, methods=['GET'])
             self.add_endpoint('/mcp/oauth/register', 'oauth_register', self.oauth_register, methods=['POST'])
             self.add_endpoint('/mcp/oauth/authorize', 'oauth_authorize', self.oauth_authorize, methods=['GET'])
             self.add_endpoint('/mcp/oauth/token', 'oauth_token', self.oauth_token, methods=['POST'])
@@ -2340,6 +2341,19 @@ class FlaskAppWrapper(object):
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "code_challenge_methods_supported": ["S256"],
+        })
+
+    def oauth_protected_resource(self):
+        """GET /.well-known/oauth-protected-resource — RFC 8707 resource metadata.
+
+        Required by the MCP 2025-03-26 spec so clients (e.g. VS Code) can
+        discover which authorization server protects this resource before
+        starting the OAuth PKCE flow.
+        """
+        base = request.host_url.rstrip('/')
+        return jsonify({
+            "resource": base + "/",
+            "authorization_servers": [base],
         })
 
     def oauth_register(self):

@@ -147,8 +147,6 @@ services:
     # Public URL of the chat service that MCP clients will connect to.
     # Defaults to the chat app's hostname and external port.
     url: "{{ services.mcp_server.url | default('http://' + (services.chat_app.hostname | default('localhost', true)) + ':' + (services.chat_app.external_port | default(7861, true) | string), true) }}"
-    # Optional bearer token when chat app auth is enabled.
-    api_key: "{{ services.mcp_server.api_key | default('', true) }}"
     # HTTP request timeout in seconds.
     timeout: {{ services.mcp_server.timeout | default(120, true) }}
 

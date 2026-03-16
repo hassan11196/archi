@@ -661,12 +661,16 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
 
         session_id = uuid.uuid4().hex
         q: queue.Queue = queue.Queue()
+        # Capture absolute base URL now — generators run outside request context.
+        base_url = request.host_url.rstrip("/")
+        post_url = f"{base_url}/mcp/messages?session_id={session_id}"
         with _sessions_lock:
             _sessions[session_id] = {"queue": q, "user_id": user_id}
+        logger.info("MCP SSE session %s opened (user=%s)", session_id, user_id)
 
         def generate():
-            # Advertise the POST endpoint to the client.
-            yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
+            # Advertise the POST endpoint using an absolute URL (MCP spec requirement).
+            yield f"event: endpoint\ndata: {post_url}\n\n"
             try:
                 while True:
                     try:
@@ -701,6 +705,8 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         with _sessions_lock:
             session_entry = _sessions.get(session_id)
         if session_entry is None:
+            logger.warning("MCP /mcp/messages: unknown session_id=%r (active sessions: %s)",
+                           session_id, list(_sessions.keys()))
             return {"error": "unknown or expired session_id"}, 404
 
         q = session_entry["queue"]
@@ -710,6 +716,8 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         if not body:
             return {"error": "request body must be valid JSON"}, 400
 
+        logger.info("MCP /mcp/messages session=%s method=%s id=%s",
+                    session_id, body.get("method", "?"), body.get("id"))
         # Run dispatch in a background thread so the 202 is returned immediately.
         # This is required for progress notifications to reach the client over SSE
         # while the tool call is still executing.

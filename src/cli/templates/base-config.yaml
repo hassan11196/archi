@@ -143,7 +143,7 @@ services:
     port: {{ services.grafana.port | default(3000, true) }}
     external_port: {{ services.grafana.external_port | default(3000, true) }}
   mcp_server:
-    enabled: {{ services.mcp_server.enabled | default(true, true) }}
+    enabled: {{ services.mcp_server.enabled | default(false, true) }}
     # Public URL of the chat service that MCP clients will connect to.
     # Defaults to the chat app's hostname and external port.
     url: "{{ services.mcp_server.url | default('http://' + (services.chat_app.hostname | default('localhost', true)) + ':' + (services.chat_app.external_port | default(7861, true) | string), true) }}"

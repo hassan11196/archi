@@ -2167,6 +2167,7 @@ class FlaskAppWrapper(object):
         self.auth_enabled = auth_config.get('enabled', False)
         self.sso_enabled = auth_config.get('sso', {}).get('enabled', False)
         self.basic_auth_enabled = auth_config.get('basic', {}).get('enabled', False)
+        self.mcp_enabled = self.services_config.get('mcp_server', {}).get('enabled', False)
         
         logger.info(f"Auth enabled: {self.auth_enabled}, SSO: {self.sso_enabled}, Basic: {self.basic_auth_enabled}")
         
@@ -2292,17 +2293,6 @@ class FlaskAppWrapper(object):
             require_auth=self.require_auth,
         )
 
-        # MCP SSE endpoint – exposes archi as MCP tools over HTTP+SSE.
-        # Clients connect with just a URL; no local CLI install needed.
-        logger.info("Adding MCP SSE endpoint at /mcp/sse")
-        from src.interfaces.chat_app.mcp_sse import register_mcp_sse
-        _mcp_auth_required = self.auth_enabled and self.sso_enabled
-        register_mcp_sse(
-            self.app, self,
-            pg_config=self.pg_config,
-            auth_enabled=_mcp_auth_required,
-        )
-
         # add unified auth endpoints
         if self.auth_enabled:
             logger.info("Adding unified authentication endpoints")
@@ -2312,18 +2302,28 @@ class FlaskAppWrapper(object):
             self.add_endpoint('/api/permissions', 'get_permissions', self.get_permissions, methods=['GET'])
             self.add_endpoint('/api/permissions/check', 'check_permission', self.check_permission_endpoint, methods=['POST'])
 
-            
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
+
+        # MCP SSE endpoint – exposes archi as MCP tools over HTTP+SSE.
+        if self.mcp_enabled:
+            logger.info("MCP server enabled – registering /mcp/* endpoints")
+            from src.interfaces.chat_app.mcp_sse import register_mcp_sse
+            _mcp_auth_required = self.auth_enabled and self.sso_enabled
+            register_mcp_sse(
+                self.app, self,
+                pg_config=self.pg_config,
+                auth_enabled=_mcp_auth_required,
+            )
+            self.add_endpoint('/.well-known/oauth-authorization-server', 'oauth_metadata', self.oauth_metadata, methods=['GET'])
+            self.add_endpoint('/mcp/oauth/register', 'oauth_register', self.oauth_register, methods=['POST'])
+            self.add_endpoint('/mcp/oauth/authorize', 'oauth_authorize', self.oauth_authorize, methods=['GET'])
+            self.add_endpoint('/mcp/oauth/token', 'oauth_token', self.oauth_token, methods=['POST'])
+            if self.auth_enabled and self.sso_enabled:
                 self.add_endpoint('/mcp/auth', 'mcp_auth', self.mcp_auth, methods=['GET'])
                 self.add_endpoint('/mcp/auth/regenerate', 'mcp_auth_regenerate', self.mcp_auth_regenerate, methods=['POST'])
-
-        # OAuth2 PKCE endpoints for MCP clients (always registered so MCP
-        # clients can discover and use the authorization server).
-        self.add_endpoint('/.well-known/oauth-authorization-server', 'oauth_metadata', self.oauth_metadata, methods=['GET'])
-        self.add_endpoint('/mcp/oauth/register', 'oauth_register', self.oauth_register, methods=['POST'])
-        self.add_endpoint('/mcp/oauth/authorize', 'oauth_authorize', self.oauth_authorize, methods=['GET'])
-        self.add_endpoint('/mcp/oauth/token', 'oauth_token', self.oauth_token, methods=['POST'])
+        else:
+            logger.info("MCP server disabled (set services.mcp_server.enabled: true to enable)")
 
     # ------------------------------------------------------------------
     # OAuth2 PKCE endpoints (used by MCP clients like Claude Desktop)

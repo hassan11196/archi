@@ -662,7 +662,11 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         session_id = uuid.uuid4().hex
         q: queue.Queue = queue.Queue()
         # Capture absolute base URL now — generators run outside request context.
-        base_url = request.host_url.rstrip("/")
+        # Behind a reverse proxy, request.host_url returns the internal address.
+        # Prefer X-Forwarded-* headers so the client gets the public URL.
+        fwd_proto = request.headers.get("X-Forwarded-Proto") or request.scheme
+        fwd_host = request.headers.get("X-Forwarded-Host") or request.host
+        base_url = f"{fwd_proto}://{fwd_host}"
         post_url = f"{base_url}/mcp/messages?session_id={session_id}"
         with _sessions_lock:
             _sessions[session_id] = {"queue": q, "user_id": user_id}
@@ -697,10 +701,11 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
     @mcp.route("/mcp/messages", methods=["POST"])
     def messages():
         """Receive a JSON-RPC message from an MCP client."""
-        _, err = _auth_check()
-        if err is not None:
-            return err
-
+        # Do NOT re-check the Bearer token here. The session_id is proof of
+        # authentication — it was issued only to the client that successfully
+        # opened the SSE stream (which already passed _auth_check). Re-checking
+        # would break VS Code and other clients that send the token for the
+        # initial SSE connection but not for subsequent POST messages.
         session_id = request.args.get("session_id", "")
         with _sessions_lock:
             session_entry = _sessions.get(session_id)

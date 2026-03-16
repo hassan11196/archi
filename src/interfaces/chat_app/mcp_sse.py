@@ -613,7 +613,8 @@ def _dispatch(body: Dict, session_queue: queue.Queue, wrapper, user_id: Optional
 # ---------------------------------------------------------------------------
 
 
-def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = False) -> None:
+def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = False,
+                     public_url: str = None) -> None:
     """Register the MCP SSE endpoints on a Flask app.
 
     Adds routes:
@@ -623,6 +624,12 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
     When ``auth_enabled`` is True, both endpoints require an
     ``Authorization: Bearer <mcp-token>`` header.  Tokens are issued via
     the ``/mcp/auth`` page after the user logs in through SSO.
+
+    ``public_url`` should be set to the externally reachable base URL of the
+    service (e.g. ``https://vocms248.cern.ch``) so that the ``endpoint`` SSE
+    event advertises the correct absolute POST URL even when the Flask process
+    sits behind a reverse proxy.  When omitted, the URL is inferred from
+    request headers (``X-Forwarded-Proto`` / ``X-Forwarded-Host``).
     """
     mcp = Blueprint("mcp_sse", __name__)
 
@@ -662,12 +669,17 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         session_id = uuid.uuid4().hex
         q: queue.Queue = queue.Queue()
         # Capture absolute base URL now — generators run outside request context.
-        # Behind a reverse proxy, request.host_url returns the internal address.
-        # Prefer X-Forwarded-* headers so the client gets the public URL.
-        fwd_proto = request.headers.get("X-Forwarded-Proto") or request.scheme
-        fwd_host = request.headers.get("X-Forwarded-Host") or request.host
-        base_url = f"{fwd_proto}://{fwd_host}"
-        post_url = f"{base_url}/mcp/messages?session_id={session_id}"
+        # Build the absolute POST URL. Priority:
+        #   1. public_url from config (most reliable — set this for production)
+        #   2. X-Forwarded-Proto / X-Forwarded-Host from reverse proxy
+        #   3. request.scheme / request.host (direct / localhost)
+        if public_url:
+            _base = public_url.rstrip("/")
+        else:
+            fwd_proto = request.headers.get("X-Forwarded-Proto") or request.scheme
+            fwd_host = request.headers.get("X-Forwarded-Host") or request.host
+            _base = f"{fwd_proto}://{fwd_host}"
+        post_url = f"{_base}/mcp/messages?session_id={session_id}"
         with _sessions_lock:
             _sessions[session_id] = {"queue": q, "user_id": user_id}
         logger.info("MCP SSE session %s opened (user=%s)", session_id, user_id)

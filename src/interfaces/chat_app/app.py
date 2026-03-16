@@ -2310,10 +2310,12 @@ class FlaskAppWrapper(object):
             logger.info("MCP server enabled – registering /mcp/* endpoints")
             from src.interfaces.chat_app.mcp_sse import register_mcp_sse
             _mcp_auth_required = self.auth_enabled and self.sso_enabled
+            _mcp_public_url = self.services_config.get('mcp_server', {}).get('url', '').rstrip('/')
             register_mcp_sse(
                 self.app, self,
                 pg_config=self.pg_config,
                 auth_enabled=_mcp_auth_required,
+                public_url=_mcp_public_url or None,
             )
             self.add_endpoint('/.well-known/oauth-authorization-server', 'oauth_metadata', self.oauth_metadata, methods=['GET'])
             self.add_endpoint('/.well-known/oauth-protected-resource', 'oauth_protected_resource', self.oauth_protected_resource, methods=['GET'])

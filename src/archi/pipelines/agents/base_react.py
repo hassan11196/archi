@@ -26,6 +26,19 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _is_context_overflow_error(exc: Exception) -> bool:
+    """Detect context-window-exceeded errors from any LLM provider."""
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "token limit",
+        "tokens. please reduce",
+        "request too large",
+    ])
+
+
 class BaseReActAgent:
     """
     BaseReActAgent provides a foundational structure for building pipeline classes that
@@ -279,6 +292,19 @@ class BaseReActAgent:
                 latest_messages=[],
                 agent_inputs=agent_inputs,
             )
+        except Exception as exc:
+            if not _is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context window overflow in %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            return self._handle_context_overflow_error(
+                error=exc,
+                latest_messages=[],
+                agent_inputs=agent_inputs,
+            )
 
     def stream(self, **kwargs) -> Iterator[PipelineOutput]:
         """Stream agent updates synchronously with structured trace events."""
@@ -464,9 +490,38 @@ class BaseReActAgent:
             )
             yield recursion_output
             return
-        
+        except Exception as exc:
+            if not _is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context window overflow during stream for %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            if thinking_step_id is not None:
+                duration_ms = int((time.time() - thinking_start_time) * 1000) if thinking_start_time else 0
+                yield self.finalize_output(
+                    answer="",
+                    memory=self.active_memory,
+                    messages=[],
+                    metadata={
+                        "event_type": "thinking_end",
+                        "step_id": thinking_step_id,
+                        "duration_ms": duration_ms,
+                        "thinking_content": accumulated_thinking,
+                    },
+                    final=False,
+                )
+            overflow_output = self._handle_context_overflow_error(
+                error=exc,
+                latest_messages=all_messages or latest_messages,
+                agent_inputs=agent_inputs,
+            )
+            yield overflow_output
+            return
+
         # Final output
-        logger.debug("Stream finished. accumulated_content='%s', all_messages count=%d", 
+        logger.debug("Stream finished. accumulated_content='%s', all_messages count=%d",
                  accumulated_content[:100] if accumulated_content else "", len(all_messages))
         
         # End thinking phase if still active
@@ -707,9 +762,38 @@ class BaseReActAgent:
             )
             yield recursion_output
             return
-        
+        except Exception as exc:
+            if not _is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context window overflow during async stream for %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            if thinking_step_id is not None:
+                duration_ms = int((time.time() - thinking_start_time) * 1000) if thinking_start_time else 0
+                yield self.finalize_output(
+                    answer="",
+                    memory=self.active_memory,
+                    messages=[],
+                    metadata={
+                        "event_type": "thinking_end",
+                        "step_id": thinking_step_id,
+                        "duration_ms": duration_ms,
+                        "thinking_content": accumulated_thinking,
+                    },
+                    final=False,
+                )
+            overflow_output = await self._handle_context_overflow_error_async(
+                error=exc,
+                latest_messages=all_messages or latest_messages,
+                agent_inputs=agent_inputs,
+            )
+            yield overflow_output
+            return
+
         # Final output
-        logger.debug("Async stream finished. accumulated_content='%s', all_messages count=%d", 
+        logger.debug("Async stream finished. accumulated_content='%s', all_messages count=%d",
                  accumulated_content[:100] if accumulated_content else "", len(all_messages))
         
         # End thinking phase if still active
@@ -1437,6 +1521,77 @@ class BaseReActAgent:
             final=True,
         )
 
+    def _handle_context_overflow_error(
+        self,
+        *,
+        error: Exception,
+        latest_messages: Sequence[BaseMessage],
+        agent_inputs: Optional[Dict[str, Any]] = None,
+    ) -> PipelineOutput:
+        """Build a best-effort response after context window overflow."""
+        metadata = {
+            "event_type": "final",
+            "context_overflow": True,
+            "error": str(error),
+        }
+        # Use only last 4 messages to avoid re-triggering overflow
+        safe_messages = list(latest_messages[-4:]) if latest_messages else []
+        wrap_message = self._generate_wrap_up_message(
+            recursion_limit=0,
+            error=error,
+            latest_messages=safe_messages,
+            agent_inputs=agent_inputs,
+        )
+        messages: List[BaseMessage] = safe_messages
+        if wrap_message:
+            messages.append(wrap_message)
+        else:
+            messages.append(
+                AIMessage(content="Context window limit reached. Could not generate a full response.")
+            )
+        return self.finalize_output(
+            answer=self._message_content(messages[-1]),
+            memory=self.active_memory,
+            messages=messages,
+            metadata=metadata,
+            final=True,
+        )
+
+    async def _handle_context_overflow_error_async(
+        self,
+        *,
+        error: Exception,
+        latest_messages: Sequence[BaseMessage],
+        agent_inputs: Optional[Dict[str, Any]] = None,
+    ) -> PipelineOutput:
+        """Async wrapper to build a best-effort response after context window overflow."""
+        metadata = {
+            "event_type": "final",
+            "context_overflow": True,
+            "error": str(error),
+        }
+        safe_messages = list(latest_messages[-4:]) if latest_messages else []
+        wrap_message = await self._generate_wrap_up_message_async(
+            recursion_limit=0,
+            error=error,
+            latest_messages=safe_messages,
+            agent_inputs=agent_inputs,
+        )
+        messages: List[BaseMessage] = safe_messages
+        if wrap_message:
+            messages.append(wrap_message)
+        else:
+            messages.append(
+                AIMessage(content="Context window limit reached. Could not generate a full response.")
+            )
+        return self.finalize_output(
+            answer=self._message_content(messages[-1]),
+            memory=self.active_memory,
+            messages=messages,
+            metadata=metadata,
+            final=True,
+        )
+
     def _generate_wrap_up_message(
         self,
         *,
@@ -1515,9 +1670,15 @@ class BaseReActAgent:
             input_messages = agent_inputs.get("messages") or []
         user_question = self._last_user_message_content(messages or input_messages) or "Unavailable"
 
+        is_context_overflow = recursion_limit == 0
+        max_snippet_chars = 2000  # Prevent wrap-up prompt from being too large
+
         conversation_snippets = []
         for msg in messages[-6:]:
-            conversation_snippets.append(f"- {self._format_message(msg)}")
+            formatted = self._format_message(msg)
+            if len(formatted) > max_snippet_chars:
+                formatted = formatted[:max_snippet_chars] + "... [truncated]"
+            conversation_snippets.append(f"- {formatted}")
 
         memory = self.active_memory
         notes = memory.intermediate_steps() if memory else []
@@ -1534,13 +1695,35 @@ class BaseReActAgent:
                 snippet = (doc.page_content or "")[:400]
                 document_summaries.append(f"- {location}: {snippet}")
 
-        prompt_sections: List[str] = [
-            (
+        if is_context_overflow:
+            preamble = (
+                "You are finalizing an interrupted ReAct agent run. The context window was exceeded "
+                "and the agent can no longer call tools. Provide one concise wrap-up response: "
+                "summarize what was attempted, cite retrieved evidence briefly, and answer the user's request "
+                "as best as possible. Do NOT call tools."
+            )
+            closing = (
+                "Respond with:\n"
+                "1) Brief summary of what was attempted.\n"
+                "2) Best possible answer using the above context.\n"
+                "3) Explicitly note that the run stopped due to context window overflow."
+            )
+        else:
+            preamble = (
                 "You are finalizing an interrupted ReAct agent run. The graph hit its recursion limit "
                 f"({recursion_limit}) and can no longer call tools. Provide one concise wrap-up response: "
                 "summarize what was attempted, cite retrieved evidence briefly, and answer the user's request "
                 "as best as possible. Do NOT call tools."
-            ),
+            )
+            closing = (
+                "Respond with:\n"
+                "1) Brief summary of what was attempted.\n"
+                "2) Best possible answer using the above context.\n"
+                f"3) Explicitly note that the run stopped after hitting the recursion limit {recursion_limit}."
+            )
+
+        prompt_sections: List[str] = [
+            preamble,
             f"User request or latest message:\n{user_question}",
         ]
         if conversation_snippets:
@@ -1551,11 +1734,7 @@ class BaseReActAgent:
             prompt_sections.append("Retrieved documents (truncated):\n" + "\n".join(document_summaries))
         error_text = str(error) if error else ""
         if error_text:
-            prompt_sections.append(f"Error detail: {error_text}")
-        prompt_sections.append(
-            "Respond with:\n"
-            "1) Brief summary of what was attempted.\n"
-            "2) Best possible answer using the above context.\n"
-            f"3) Explicitly note that the run stopped after hitting the recursion limit {recursion_limit}."
-        )
+            error_snippet = error_text[:500] if len(error_text) > 500 else error_text
+            prompt_sections.append(f"Error detail: {error_snippet}")
+        prompt_sections.append(closing)
         return "\n\n".join(prompt_sections)

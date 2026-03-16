@@ -71,7 +71,7 @@ import queue
 import textwrap
 import uuid
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, Optional
 
 import psycopg2
@@ -587,6 +587,12 @@ def _dispatch(body: Dict, session_queue: queue.Queue, wrapper, user_id: Optional
         meta = params.get("_meta") or {}
         progress_token = meta.get("progressToken")
 
+        logger.info(
+            "tools/call %s – progressToken=%s",
+            params.get("name", "?"),
+            progress_token if progress_token is not None else "<none: non-streaming>",
+        )
+
         notify = None
         if progress_token is not None:
             _progress_counter = [0]
@@ -725,7 +731,10 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         if not body:
             return {"error": "request body must be valid JSON"}, 400
 
-        _dispatch(body, q, wrapper, user_id)
+        # Run dispatch in a background thread so the 202 is returned immediately.
+        # This is required for progress notifications to reach the client over SSE
+        # while the tool call is still executing.
+        Thread(target=_dispatch, args=(body, q, wrapper, user_id), daemon=True).start()
         return "", 202
 
     app.register_blueprint(mcp)

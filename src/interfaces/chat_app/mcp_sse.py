@@ -291,11 +291,23 @@ def _text(text: str) -> Dict:
 # ---------------------------------------------------------------------------
 
 
-def _call_tool(name: str, arguments: Dict[str, Any], wrapper, user_id: Optional[str] = None) -> Dict:
-    """Dispatch a tools/call request to the appropriate archi internals."""
+def _call_tool(
+    name: str,
+    arguments: Dict[str, Any],
+    wrapper,
+    user_id: Optional[str] = None,
+    notify=None,
+) -> Dict:
+    """Dispatch a tools/call request to the appropriate archi internals.
+
+    ``notify`` is an optional callable(message, progress, total) that sends a
+    ``notifications/progress`` event back to the MCP client over the SSE stream.
+    It is only provided when the client included ``_meta.progressToken`` in the
+    tools/call request.
+    """
     try:
         if name == "archi_query":
-            return _tool_query(arguments, wrapper, user_id)
+            return _tool_query(arguments, wrapper, user_id, notify=notify)
         elif name == "archi_list_documents":
             return _tool_list_documents(arguments, wrapper)
         elif name == "archi_get_document_content":
@@ -313,25 +325,110 @@ def _call_tool(name: str, arguments: Dict[str, Any], wrapper, user_id: Optional[
         return _text(f"ERROR: {exc}")
 
 
-def _tool_query(arguments: Dict[str, Any], wrapper, user_id: Optional[str] = None) -> Dict:
+def _tool_query(
+    arguments: Dict[str, Any],
+    wrapper,
+    user_id: Optional[str] = None,
+    notify=None,
+) -> Dict:
     question = (arguments.get("question") or "").strip()
     if not question:
         return _text("ERROR: 'question' is required.")
 
     conversation_id = arguments.get("conversation_id")
+    provider = arguments.get("provider") or None
+    model = arguments.get("model") or None
     client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
 
+    # -------------------------------------------------------------------
+    # Streaming path: client supplied a progressToken → emit progress events
+    # as archi works (thinking, tool calls, text chunks) then return the
+    # final assembled answer.
+    # -------------------------------------------------------------------
+    if notify is not None:
+        answer_parts: list[str] = []
+        new_conv_id = None
+
+        for event in wrapper.stream(
+            [["User", question]],
+            conversation_id,
+            client_id,
+            False,           # is_refresh
+            now,             # server_received_msg_ts
+            now.timestamp(), # client_sent_msg_ts
+            120.0,           # client_timeout
+            None,            # config_name (use active)
+            provider=provider,
+            model=model,
+            user_id=user_id,
+        ):
+            etype = event.get("type", "")
+
+            if etype == "error":
+                return _text(f"ERROR: {event.get('message', 'unknown error')}")
+
+            elif etype == "thinking_start":
+                notify("Thinking…")
+
+            elif etype == "thinking_end":
+                thinking = event.get("thinking_content", "")
+                if thinking:
+                    preview = thinking[:120].replace("\n", " ")
+                    notify(f"Thought: {preview}{'…' if len(thinking) > 120 else ''}")
+
+            elif etype == "tool_start":
+                tool_name = event.get("tool_name", "tool")
+                tool_args = event.get("tool_args") or {}
+                # Build a short human-readable summary of args
+                if tool_args:
+                    args_preview = ", ".join(
+                        f"{k}={str(v)[:40]}" for k, v in (tool_args if isinstance(tool_args, dict) else {}).items()
+                    )
+                    notify(f"Calling {tool_name}({args_preview})")
+                else:
+                    notify(f"Calling {tool_name}()")
+
+            elif etype == "tool_output":
+                tool_name = event.get("tool_name", "tool")
+                notify(f"Got result from {tool_name}")
+
+            elif etype == "chunk":
+                content = event.get("content", "")
+                if content:
+                    answer_parts.append(content)
+                    notify(f"Generating answer…")
+
+            elif etype == "final":
+                conv_id = event.get("conversation_id")
+                if conv_id is not None:
+                    new_conv_id = conv_id
+                # Prefer the assembled text; fall back to final answer field
+                if not answer_parts:
+                    answer_parts.append(event.get("answer") or event.get("content") or "")
+
+        answer = "".join(answer_parts)
+        parts = [answer]
+        if new_conv_id is not None:
+            parts.append(
+                f"\n\n---\n_conversation_id: {new_conv_id} "
+                "(pass this to archi_query to continue the conversation)_"
+            )
+        return _text("".join(parts))
+
+    # -------------------------------------------------------------------
+    # Non-streaming path: no progressToken → single blocking call
+    # -------------------------------------------------------------------
     response, new_conv_id, _, _, error_code = wrapper.chat(
-        [["User", question]],  # same format as last_message from the JS client
+        [["User", question]],
         conversation_id,
         client_id,
-        False,    # is_refresh
-        now,              # server_received_msg_ts
-        now.timestamp(),  # client_sent_msg_ts
-        120.0,            # client_timeout (seconds)
-        None,     # config_name  (use active config)
-        user_id,  # user_id from SSO bearer token
+        False,
+        now,
+        now.timestamp(),
+        120.0,
+        None,
+        user_id,
     )
 
     if error_code is not None:
@@ -485,11 +582,37 @@ def _dispatch(body: Dict, session_queue: queue.Queue, wrapper, user_id: Optional
     elif method == "tools/list":
         response = _ok({"tools": _TOOLS}, rpc_id)
     elif method == "tools/call":
+        # Extract optional progress token from _meta so we can stream status
+        # events back to the client while archi works.
+        meta = params.get("_meta") or {}
+        progress_token = meta.get("progressToken")
+
+        notify = None
+        if progress_token is not None:
+            _progress_counter = [0]
+
+            def notify(message: str, progress: int = None, total: int = None) -> None:
+                _progress_counter[0] += 1
+                p = progress if progress is not None else _progress_counter[0]
+                notification: Dict[str, Any] = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": progress_token,
+                        "progress": p,
+                        "message": message,
+                    },
+                }
+                if total is not None:
+                    notification["params"]["total"] = total
+                session_queue.put(notification)
+
         result = _call_tool(
             params.get("name", ""),
             params.get("arguments") or {},
             wrapper,
             user_id,
+            notify=notify,
         )
         response = _ok(result, rpc_id)
     elif method == "ping":

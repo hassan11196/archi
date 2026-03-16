@@ -341,46 +341,45 @@ def _tool_query(
     client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
 
-    # -------------------------------------------------------------------
-    # Streaming path: client supplied a progressToken → emit progress events
-    # as archi works (thinking, tool calls, text chunks) then return the
-    # final assembled answer.
-    # -------------------------------------------------------------------
-    if notify is not None:
-        answer_parts: list[str] = []
-        new_conv_id = None
+    # Always use the streaming pipeline so behaviour is identical to the web
+    # app regardless of whether the client supplied a progressToken.
+    # When notify is None (no progressToken) we simply skip the notifications.
+    answer_parts: list[str] = []
+    new_conv_id = None
 
-        for event in wrapper.chat.stream(
-            [["User", question]],
-            conversation_id,
-            client_id,
-            False,           # is_refresh
-            now,             # server_received_msg_ts
-            now.timestamp(), # client_sent_msg_ts
-            120.0,           # client_timeout
-            None,            # config_name (use active)
-            provider=provider,
-            model=model,
-            user_id=user_id,
-        ):
-            etype = event.get("type", "")
+    for event in wrapper.chat.stream(
+        [["User", question]],
+        conversation_id,
+        client_id,
+        False,           # is_refresh
+        now,             # server_received_msg_ts
+        now.timestamp(), # client_sent_msg_ts
+        120.0,           # client_timeout
+        None,            # config_name (use active)
+        provider=provider,
+        model=model,
+        user_id=user_id,
+    ):
+        etype = event.get("type", "")
 
-            if etype == "error":
-                return _text(f"ERROR: {event.get('message', 'unknown error')}")
+        if etype == "error":
+            return _text(f"ERROR: {event.get('message', 'unknown error')}")
 
-            elif etype == "thinking_start":
+        elif etype == "thinking_start":
+            if notify:
                 notify("Thinking…")
 
-            elif etype == "thinking_end":
+        elif etype == "thinking_end":
+            if notify:
                 thinking = event.get("thinking_content", "")
                 if thinking:
                     preview = thinking[:120].replace("\n", " ")
                     notify(f"Thought: {preview}{'…' if len(thinking) > 120 else ''}")
 
-            elif etype == "tool_start":
+        elif etype == "tool_start":
+            if notify:
                 tool_name = event.get("tool_name", "tool")
                 tool_args = event.get("tool_args") or {}
-                # Build a short human-readable summary of args
                 if tool_args:
                     args_preview = ", ".join(
                         f"{k}={str(v)[:40]}" for k, v in (tool_args if isinstance(tool_args, dict) else {}).items()
@@ -389,52 +388,26 @@ def _tool_query(
                 else:
                     notify(f"Calling {tool_name}()")
 
-            elif etype == "tool_output":
-                tool_name = event.get("tool_name", "tool")
-                notify(f"Got result from {tool_name}")
+        elif etype == "tool_output":
+            if notify:
+                notify(f"Got result from {event.get('tool_name', 'tool')}")
 
-            elif etype == "chunk":
-                content = event.get("content", "")
-                if content:
-                    answer_parts.append(content)
-                    notify(f"Generating answer…")
+        elif etype == "chunk":
+            content = event.get("content", "")
+            if content:
+                answer_parts.append(content)
+                if notify:
+                    notify("Generating answer…")
 
-            elif etype == "final":
-                conv_id = event.get("conversation_id")
-                if conv_id is not None:
-                    new_conv_id = conv_id
-                # Prefer the assembled text; fall back to final answer field
-                if not answer_parts:
-                    answer_parts.append(event.get("answer") or event.get("content") or "")
+        elif etype == "final":
+            conv_id = event.get("conversation_id")
+            if conv_id is not None:
+                new_conv_id = conv_id
+            if not answer_parts:
+                answer_parts.append(event.get("answer") or event.get("content") or "")
 
-        answer = "".join(answer_parts)
-        parts = [answer]
-        if new_conv_id is not None:
-            parts.append(
-                f"\n\n---\n_conversation_id: {new_conv_id} "
-                "(pass this to archi_query to continue the conversation)_"
-            )
-        return _text("".join(parts))
-
-    # -------------------------------------------------------------------
-    # Non-streaming path: no progressToken → single blocking call
-    # -------------------------------------------------------------------
-    response, new_conv_id, _, _, error_code = wrapper.chat(
-        [["User", question]],
-        conversation_id,
-        client_id,
-        False,
-        now,
-        now.timestamp(),
-        120.0,
-        None,
-        user_id,
-    )
-
-    if error_code is not None:
-        return _text(f"ERROR: chat returned error code {error_code}.")
-
-    parts = [response or ""]
+    answer = "".join(answer_parts)
+    parts = [answer]
     if new_conv_id is not None:
         parts.append(
             f"\n\n---\n_conversation_id: {new_conv_id} "

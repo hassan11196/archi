@@ -2332,9 +2332,18 @@ class FlaskAppWrapper(object):
     # OAuth2 PKCE endpoints (used by MCP clients like Claude Desktop)
     # ------------------------------------------------------------------
 
+    def _mcp_public_base_url(self) -> str:
+        """Return the public base URL for MCP endpoints."""
+        configured = self.services_config.get('mcp_server', {}).get('url', '').rstrip('/')
+        if configured:
+            return configured
+        fwd_proto = request.headers.get("X-Forwarded-Proto") or request.scheme
+        fwd_host = request.headers.get("X-Forwarded-Host") or request.host
+        return f"{fwd_proto}://{fwd_host}"
+
     def oauth_metadata(self):
         """GET /.well-known/oauth-authorization-server — RFC 8414 discovery doc."""
-        base = request.host_url.rstrip('/')
+        base = self._mcp_public_base_url()
         return jsonify({
             "issuer": base,
             "authorization_endpoint": base + "/mcp/oauth/authorize",
@@ -2346,13 +2355,8 @@ class FlaskAppWrapper(object):
         })
 
     def oauth_protected_resource(self):
-        """GET /.well-known/oauth-protected-resource — RFC 8707 resource metadata.
-
-        Required by the MCP 2025-03-26 spec so clients (e.g. VS Code) can
-        discover which authorization server protects this resource before
-        starting the OAuth PKCE flow.
-        """
-        base = request.host_url.rstrip('/')
+        """GET /.well-known/oauth-protected-resource — RFC 8707 resource metadata."""
+        base = self._mcp_public_base_url()
         return jsonify({
             "resource": base + "/",
             "authorization_servers": [base],
@@ -2387,7 +2391,7 @@ class FlaskAppWrapper(object):
         finally:
             conn.close()
 
-        base = request.host_url.rstrip('/')
+        base = self._mcp_public_base_url()
         return jsonify({
             "client_id": client_id,
             "client_name": client_name,
@@ -2802,7 +2806,7 @@ class FlaskAppWrapper(object):
         if not token:
             token = self._create_mcp_token(user_id)
 
-        mcp_url = request.host_url.rstrip('/') + '/mcp/sse'
+        mcp_url = self._mcp_public_base_url() + '/mcp/sse'
         regenerated = request.args.get('regenerated') == '1'
 
         return render_template(

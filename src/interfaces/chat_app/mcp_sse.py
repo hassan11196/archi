@@ -47,21 +47,8 @@ Claude Code  (run once in terminal):
       }
     }
 
-Protocol
---------
-This implements the MCP SSE transport (JSON-RPC 2.0 over Server-Sent Events):
-
-  1.  Client GETs /mcp/sse  →  receives an SSE stream.
-  2.  Server immediately sends an "endpoint" event with the POST URL:
-          event: endpoint
-          data: /mcp/messages?session_id=<uuid>
-  3.  Client POSTs JSON-RPC messages to /mcp/messages?session_id=<uuid>.
-  4.  Server pushes JSON-RPC responses back via the SSE stream.
-  5.  Keepalive comments (": keepalive") are sent every 30 s to prevent
-      proxies from closing idle connections.
-
-No external ``mcp`` package is required for the SSE transport – the protocol
-is implemented directly in Flask using thread-safe queues.
+Implements the MCP SSE transport (JSON-RPC 2.0 over Server-Sent Events)
+directly in Flask using thread-safe queues — no external ``mcp`` package needed.
 """
 
 from __future__ import annotations
@@ -341,13 +328,7 @@ def _tool_query(
     client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
 
-    # Always use the streaming pipeline so behaviour is identical to the web
-    # app regardless of whether the client supplied a progressToken.
-    # When notify is None (no progressToken) we simply skip the notifications.
-    #
-    # NOTE: chunk events carry *accumulated* text (the full answer so far), not
-    # deltas.  We must NOT join them — only the last one (or final.response.answer)
-    # is the complete answer.
+    # Chunk events carry accumulated text (not deltas) — keep only the last one.
     answer: str = ""
     new_conv_id = None
 
@@ -397,7 +378,6 @@ def _tool_query(
                 notify(f"Got result from {event.get('tool_name', 'tool')}")
 
         elif etype == "chunk":
-            # content is accumulated (full text so far) — overwrite, never append
             content = event.get("content", "")
             if content:
                 answer = content
@@ -408,7 +388,6 @@ def _tool_query(
             conv_id = event.get("conversation_id")
             if conv_id is not None:
                 new_conv_id = conv_id
-            # Prefer the clean answer from PipelineOutput over the last chunk
             response = event.get("response")
             final_answer = getattr(response, "answer", None) if response is not None else None
             if final_answer:
@@ -617,19 +596,9 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
                      public_url: str = None) -> None:
     """Register the MCP SSE endpoints on a Flask app.
 
-    Adds routes:
-      GET  /mcp/sse        – SSE stream (MCP clients connect here)
-      POST /mcp/messages   – JSON-RPC message receiver
-
-    When ``auth_enabled`` is True, both endpoints require an
-    ``Authorization: Bearer <mcp-token>`` header.  Tokens are issued via
-    the ``/mcp/auth`` page after the user logs in through SSO.
-
-    ``public_url`` should be set to the externally reachable base URL of the
-    service (e.g. ``https://vocms248.cern.ch``) so that the ``endpoint`` SSE
-    event advertises the correct absolute POST URL even when the Flask process
-    sits behind a reverse proxy.  When omitted, the URL is inferred from
-    request headers (``X-Forwarded-Proto`` / ``X-Forwarded-Host``).
+    ``public_url``: externally reachable base URL (e.g. ``https://example.com``).
+    When set, the ``endpoint`` SSE event uses it to build the absolute POST URL
+    instead of inferring from request headers.
     """
     mcp = Blueprint("mcp_sse", __name__)
 
@@ -668,11 +637,7 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
 
         session_id = uuid.uuid4().hex
         q: queue.Queue = queue.Queue()
-        # Capture absolute base URL now — generators run outside request context.
-        # Build the absolute POST URL. Priority:
-        #   1. public_url from config (most reliable — set this for production)
-        #   2. X-Forwarded-Proto / X-Forwarded-Host from reverse proxy
-        #   3. request.scheme / request.host (direct / localhost)
+        # Resolve base URL now — generators run outside request context.
         if public_url:
             _base = public_url.rstrip("/")
         else:
@@ -685,7 +650,6 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
         logger.info("MCP SSE session %s opened (user=%s)", session_id, user_id)
 
         def generate():
-            # Advertise the POST endpoint using an absolute URL (MCP spec requirement).
             yield f"event: endpoint\ndata: {post_url}\n\n"
             try:
                 while True:
@@ -713,11 +677,7 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
     @mcp.route("/mcp/messages", methods=["POST"])
     def messages():
         """Receive a JSON-RPC message from an MCP client."""
-        # Do NOT re-check the Bearer token here. The session_id is proof of
-        # authentication — it was issued only to the client that successfully
-        # opened the SSE stream (which already passed _auth_check). Re-checking
-        # would break VS Code and other clients that send the token for the
-        # initial SSE connection but not for subsequent POST messages.
+        # Auth was verified when the SSE stream was opened; session_id is the proof.
         session_id = request.args.get("session_id", "")
         with _sessions_lock:
             session_entry = _sessions.get(session_id)

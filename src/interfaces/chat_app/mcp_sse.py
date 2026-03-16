@@ -344,7 +344,11 @@ def _tool_query(
     # Always use the streaming pipeline so behaviour is identical to the web
     # app regardless of whether the client supplied a progressToken.
     # When notify is None (no progressToken) we simply skip the notifications.
-    answer_parts: list[str] = []
+    #
+    # NOTE: chunk events carry *accumulated* text (the full answer so far), not
+    # deltas.  We must NOT join them — only the last one (or final.response.answer)
+    # is the complete answer.
+    answer: str = ""
     new_conv_id = None
 
     for event in wrapper.chat.stream(
@@ -393,9 +397,10 @@ def _tool_query(
                 notify(f"Got result from {event.get('tool_name', 'tool')}")
 
         elif etype == "chunk":
+            # content is accumulated (full text so far) — overwrite, never append
             content = event.get("content", "")
             if content:
-                answer_parts.append(content)
+                answer = content
                 if notify:
                     notify("Generating answer…")
 
@@ -403,10 +408,11 @@ def _tool_query(
             conv_id = event.get("conversation_id")
             if conv_id is not None:
                 new_conv_id = conv_id
-            if not answer_parts:
-                answer_parts.append(event.get("answer") or event.get("content") or "")
-
-    answer = "".join(answer_parts)
+            # Prefer the clean answer from PipelineOutput over the last chunk
+            response = event.get("response")
+            final_answer = getattr(response, "answer", None) if response is not None else None
+            if final_answer:
+                answer = final_answer
     parts = [answer]
     if new_conv_id is not None:
         parts.append(

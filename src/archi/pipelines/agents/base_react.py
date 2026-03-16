@@ -20,6 +20,12 @@ from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
 from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+from src.archi.pipelines.agents.utils.context_condensation import (
+    condense_messages,
+    truncate_tool_output,
+    CONDENSATION_THRESHOLD,
+)
+from src.archi.pipelines.agents.middleware import ContextWindowMiddleware
 from src.archi.pipelines.agents.tools import initialize_mcp_client
 from src.utils.logging import get_logger
 
@@ -1096,11 +1102,15 @@ class BaseReActAgent:
                 # Capture the runner in closure
                 runner = self._async_runner
 
-                def sync_wrapper(*args, **kwargs):
+                tool_name = getattr(async_tool, "name", "mcp_tool")
+
+                def sync_wrapper(*args, _tool_name=tool_name, **kwargs):
                     if runner.in_loop_thread():
                         raise RuntimeError("sync_wrapper called from MCP loop thread; would deadlock")
                     # Run on the background loop - NOT a new loop!
-                    return runner.run(async_tool.coroutine(*args, **kwargs))
+                    result = runner.run(async_tool.coroutine(*args, **kwargs))
+                    # Enforce output size limit to prevent context overflow
+                    return truncate_tool_output(result, tool_name=_tool_name)
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper
@@ -1116,8 +1126,29 @@ class BaseReActAgent:
             logger.error(f"Failed to load MCP tools: {e}", exc_info=True)
 
     def _build_static_middleware(self) -> List[Callable]:
-        """Build and returns static middleware defined in the config."""
-        return []
+        """Build and returns static middleware defined in the config.
+
+        Includes ContextWindowMiddleware by default to prevent context-window
+        overflow during the agent's ReAct loop.
+        """
+        middleware = []
+
+        # Add context-window condensation middleware
+        context_window = self._get_model_context_window()
+        if context_window and isinstance(context_window, int) and context_window > 0:
+            middleware.append(
+                ContextWindowMiddleware(
+                    llm=self.agent_llm,
+                    context_window=context_window,
+                )
+            )
+            logger.debug(
+                "ContextWindowMiddleware enabled: context_window=%d, threshold=%.0f%%",
+                context_window,
+                CONDENSATION_THRESHOLD * 100,
+            )
+
+        return middleware
 
     def _store_documents(self, stage: str, docs: Sequence[Document]) -> None:
         """Centralised helper used by tools to record documents into the active memory."""
@@ -1178,7 +1209,10 @@ class BaseReActAgent:
                 snippet = content if len(content) <= 200 else f"{content[:197]}..."
                 memory.note(f"Latest user message: {snippet}")
 
-        # --- Token trimming based on model context window ---
+        # --- Token condensation based on model context window ---
+        # Uses the same condensation logic as the ContextWindowMiddleware
+        # (which runs before each LLM call during the ReAct loop), but
+        # applied here to the initial history before the loop starts.
         try:
             if hasattr(self.agent_llm, "get_num_tokens_from_messages"):
 
@@ -1200,33 +1234,18 @@ class BaseReActAgent:
 
                 token_count = self.agent_llm.get_num_tokens_from_messages(history_messages)
 
-                # Soft compression phase
-                compression_round = 0
-                while token_count >= max_prompt_tokens and len(history_messages) > 1:
-                    compression_round += 1
-                    logger.debug("Compression round %d triggered.", compression_round)
-
-                    history_messages = self._compress_history(history_messages)
-                    token_count = self.agent_llm.get_num_tokens_from_messages(
-                        history_messages
-                    )
-
-                    # Prevent infinite compression loop
-                    if compression_round > 3:
-                        logger.warning("Exceeded max compression rounds.")
-                        break
-
-                   # Hard safeguard: crop if still too large
                 if token_count >= max_prompt_tokens:
-                    logger.warning("History still exceeds token limit (%d >= %d). Forcibly cropping.",token_count,max_prompt_tokens,)
-                    keep_last_n = 4
-                    history_messages = history_messages[-keep_last_n:]
+                    logger.info(
+                        "Initial history exceeds budget (%d >= %d). Running condensation.",
+                        token_count, max_prompt_tokens,
+                    )
+                    history_messages = condense_messages(
+                        list(history_messages),
+                        max_prompt_tokens=max_prompt_tokens,
+                        token_counter=self.agent_llm.get_num_tokens_from_messages,
+                        llm=self.agent_llm,
+                    )
                     token_count = self.agent_llm.get_num_tokens_from_messages(history_messages)
-
-                    # --- Brutal safeguard: truncate content ---
-                    while (token_count >= max_prompt_tokens and len(history_messages) > 1):
-                        history_messages.pop(0)
-                        token_count = self.agent_llm.get_num_tokens_from_messages(history_messages)
 
                 logger.debug("Final trimmed token count: %d", token_count)
 

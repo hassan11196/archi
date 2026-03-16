@@ -291,11 +291,11 @@ def _text(text: str) -> Dict:
 # ---------------------------------------------------------------------------
 
 
-def _call_tool(name: str, arguments: Dict[str, Any], wrapper) -> Dict:
+def _call_tool(name: str, arguments: Dict[str, Any], wrapper, user_id: Optional[str] = None) -> Dict:
     """Dispatch a tools/call request to the appropriate archi internals."""
     try:
         if name == "archi_query":
-            return _tool_query(arguments, wrapper)
+            return _tool_query(arguments, wrapper, user_id)
         elif name == "archi_list_documents":
             return _tool_list_documents(arguments, wrapper)
         elif name == "archi_get_document_content":
@@ -313,7 +313,7 @@ def _call_tool(name: str, arguments: Dict[str, Any], wrapper) -> Dict:
         return _text(f"ERROR: {exc}")
 
 
-def _tool_query(arguments: Dict[str, Any], wrapper) -> Dict:
+def _tool_query(arguments: Dict[str, Any], wrapper, user_id: Optional[str] = None) -> Dict:
     question = (arguments.get("question") or "").strip()
     if not question:
         return _text("ERROR: 'question' is required.")
@@ -331,6 +331,7 @@ def _tool_query(arguments: Dict[str, Any], wrapper) -> Dict:
         now.timestamp(),  # client_sent_msg_ts
         120.0,            # client_timeout (seconds)
         None,     # config_name  (use active config)
+        user_id,  # user_id from SSO bearer token
     )
 
     if error_code is not None:
@@ -462,7 +463,7 @@ def _tool_list_agents(wrapper) -> Dict:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(body: Dict, session_queue: queue.Queue, wrapper) -> None:
+def _dispatch(body: Dict, session_queue: queue.Queue, wrapper, user_id: Optional[str] = None) -> None:
     """Process one incoming JSON-RPC message and enqueue the response if needed."""
     rpc_id = body.get("id")
     method = body.get("method", "")
@@ -488,6 +489,7 @@ def _dispatch(body: Dict, session_queue: queue.Queue, wrapper) -> None:
             params.get("name", ""),
             params.get("arguments") or {},
             wrapper,
+            user_id,
         )
         response = _ok(result, rpc_id)
     elif method == "ping":
@@ -594,12 +596,13 @@ def register_mcp_sse(app, wrapper, pg_config: dict = None, auth_enabled: bool = 
             return {"error": "unknown or expired session_id"}, 404
 
         q = session_entry["queue"]
+        user_id = session_entry.get("user_id")
 
         body = request.get_json(silent=True)
         if not body:
             return {"error": "request body must be valid JSON"}, 400
 
-        _dispatch(body, q, wrapper)
+        _dispatch(body, q, wrapper, user_id)
         return "", 202
 
     app.register_blueprint(mcp)

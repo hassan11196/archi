@@ -56,27 +56,21 @@
 
       {% if regenerated %}
       <div class="notice">
-        Token regenerated. Your previous token is now invalid. Update your IDE config below.
+        Token regenerated. Your previous token is now invalid.
       </div>
       {% endif %}
 
-      <!-- Token -->
-      <div class="card">
-        <h2>Your token</h2>
-        <div class="notice warn" style="margin-bottom:14px">
-          Keep this token secret – it grants access to archi on your behalf.
-        </div>
-        <div class="token-row">
-          <div class="token-box" id="token-display">{{ token }}</div>
-          <button class="copy-btn" onclick="copyToken()">Copy</button>
-        </div>
+      <div class="notice" style="margin-bottom:24px">
+        <strong>OAuth login is handled automatically.</strong>
+        Paste the snippet for your IDE below — no token required in the config.
+        Your IDE will open a browser to log you in on first use and manage tokens itself.
       </div>
 
       <!-- IDE config snippets -->
       <div class="card">
         <h2>Add to your IDE</h2>
         <p style="font-size:0.9rem;color:#555;margin:0 0 16px">
-          Paste one of the snippets below into your IDE's MCP configuration file.
+          Paste one of the snippets below into your IDE's MCP configuration file. Set it once and never touch it again.
         </p>
 
         <div class="tab-bar">
@@ -90,15 +84,13 @@
           <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
             File: <code>.vscode/mcp.json</code> (in your project root) or
             <code>settings.json</code> under <code>mcp.servers</code>.
+            VS Code will open a browser to log in on first use — no token needed in the config.
           </p>
           <pre id="vscode-snippet">{
   "servers": {
     "archi": {
       "type": "sse",
-      "url": "{{ mcp_url }}",
-      "headers": {
-        "Authorization": "Bearer {{ token }}"
-      }
+      "url": "{{ mcp_url }}"
     }
   }
 }</pre>
@@ -107,15 +99,13 @@
 
         <div id="tab-cursor" class="tab-content">
           <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
-            File: <code>~/.cursor/mcp.json</code>
+            File: <code>~/.cursor/mcp.json</code>.
+            Cursor will open a browser to log in on first use — no token needed in the config.
           </p>
           <pre id="cursor-snippet">{
   "mcpServers": {
     "archi": {
-      "url": "{{ mcp_url }}",
-      "headers": {
-        "Authorization": "Bearer {{ token }}"
-      }
+      "url": "{{ mcp_url }}"
     }
   }
 }</pre>
@@ -126,7 +116,8 @@
           <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
             File: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code> (macOS)
             or <code>%APPDATA%\Claude\claude_desktop_config.json</code> (Windows).
-            Restart Claude Desktop after saving.
+            Restart Claude Desktop after saving. <code>mcp-remote</code> will open a browser to
+            log in on first use and store the token locally — no token needed in the config.
           </p>
           <pre id="claude-snippet">{
   "mcpServers": {
@@ -134,9 +125,7 @@
       "command": "npx",
       "args": [
         "mcp-remote",
-        "{{ mcp_url }}",
-        "--header",
-        "Authorization: Bearer {{ token }}"
+        "{{ mcp_url }}"
       ]
     }
   }
@@ -147,11 +136,9 @@
         <div id="tab-claudecode" class="tab-content">
           <p style="font-size:0.85rem;color:#555;margin:0 0 8px">
             Run this once in your terminal to register archi globally. Claude Code stores it in
-            <code>~/.claude.json</code>.
+            <code>~/.claude.json</code>. It will open a browser to log in on first use.
           </p>
-          <pre id="claudecode-snippet">claude mcp add --transport sse \
-  --header "Authorization: Bearer {{ token }}" \
-  archi {{ mcp_url }}</pre>
+          <pre id="claudecode-snippet">claude mcp add --transport sse archi {{ mcp_url }}</pre>
           <button class="copy-btn" style="margin-top:10px" onclick="copySnippet('claudecode-snippet')">Copy command</button>
           <p style="font-size:0.85rem;color:#555;margin:12px 0 8px">
             Or add it to <code>.mcp.json</code> in your project root for project-scoped access:
@@ -160,10 +147,7 @@
   "mcpServers": {
     "archi": {
       "type": "sse",
-      "url": "{{ mcp_url }}",
-      "headers": {
-        "Authorization": "Bearer {{ token }}"
-      }
+      "url": "{{ mcp_url }}"
     }
   }
 }</pre>
@@ -171,17 +155,34 @@
         </div>
       </div>
 
-      <!-- Danger zone -->
-      <div class="danger-zone">
-        <h2>Rotate token</h2>
-        <p style="font-size:0.85rem;color:#555;margin:0 0 12px">
-          Regenerate a new token. Your current token will stop working immediately.
-        </p>
-        <form class="regen-form" method="POST" action="/mcp/auth/regenerate"
-              onsubmit="return confirm('Regenerate your MCP token? The current token will be invalidated.')">
-          <button type="submit">Regenerate token</button>
-        </form>
-      </div>
+      <!-- Advanced: manual token for clients that don't support OAuth -->
+      <details style="margin-top:32px">
+        <summary style="cursor:pointer;font-size:0.95rem;font-weight:600;color:#555">
+          Advanced: manual bearer token
+        </summary>
+        <div style="margin-top:16px">
+          <p style="font-size:0.85rem;color:#555;margin:0 0 12px">
+            For clients that don't support OAuth, use this static token directly in the
+            <code>Authorization: Bearer &lt;token&gt;</code> header.
+            Keep it secret — it grants access to archi on your behalf.
+          </p>
+          <div class="token-row" style="margin-bottom:16px">
+            <div class="token-box" id="token-display">{{ token }}</div>
+            <button class="copy-btn" onclick="copyToken()">Copy</button>
+          </div>
+          <div class="danger-zone">
+            <h2>Rotate token</h2>
+            <p style="font-size:0.85rem;color:#555;margin:0 0 12px">
+              Regenerate a new token. Your current token will stop working immediately.
+              OAuth sessions are unaffected.
+            </p>
+            <form class="regen-form" method="POST" action="/mcp/auth/regenerate"
+                  onsubmit="return confirm('Regenerate your MCP token? The current token will be invalidated.')">
+              <button type="submit">Regenerate token</button>
+            </form>
+          </div>
+        </div>
+      </details>
     </div>
 
     <script>

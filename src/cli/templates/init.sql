@@ -118,6 +118,14 @@ CREATE TABLE IF NOT EXISTS mcp_auth_codes (
 
 CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at);
 
+-- OAuth2 dynamic client registrations (RFC 7591) used by MCP clients.
+CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+    client_id VARCHAR(32) PRIMARY KEY,    -- secrets.token_hex(16)
+    client_name TEXT,
+    redirect_uris TEXT[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ============================================================================
 -- 2. STATIC CONFIGURATION (Deploy-Time)
 -- ============================================================================

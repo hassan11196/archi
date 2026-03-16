@@ -2321,8 +2321,9 @@ class FlaskAppWrapper(object):
         # OAuth2 PKCE endpoints for MCP clients (always registered so MCP
         # clients can discover and use the authorization server).
         self.add_endpoint('/.well-known/oauth-authorization-server', 'oauth_metadata', self.oauth_metadata, methods=['GET'])
-        self.add_endpoint('/authorize', 'oauth_authorize', self.oauth_authorize, methods=['GET'])
-        self.add_endpoint('/token', 'oauth_token', self.oauth_token, methods=['POST'])
+        self.add_endpoint('/mcp/oauth/register', 'oauth_register', self.oauth_register, methods=['POST'])
+        self.add_endpoint('/mcp/oauth/authorize', 'oauth_authorize', self.oauth_authorize, methods=['GET'])
+        self.add_endpoint('/mcp/oauth/token', 'oauth_token', self.oauth_token, methods=['POST'])
 
     # ------------------------------------------------------------------
     # OAuth2 PKCE endpoints (used by MCP clients like Claude Desktop)
@@ -2333,15 +2334,56 @@ class FlaskAppWrapper(object):
         base = request.host_url.rstrip('/')
         return jsonify({
             "issuer": base,
-            "authorization_endpoint": base + "/authorize",
-            "token_endpoint": base + "/token",
+            "authorization_endpoint": base + "/mcp/oauth/authorize",
+            "token_endpoint": base + "/mcp/oauth/token",
+            "registration_endpoint": base + "/mcp/oauth/register",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "code_challenge_methods_supported": ["S256"],
         })
 
+    def oauth_register(self):
+        """POST /mcp/oauth/register — RFC 7591 dynamic client registration.
+
+        MCP clients (mcp-remote, Claude Desktop, VS Code) call this once to
+        obtain a client_id before starting the authorization flow.  We keep
+        it simple: any caller may register; we persist the client and return
+        a client_id immediately (no client_secret for public clients).
+        """
+        body = request.get_json(silent=True) or {}
+        redirect_uris = body.get("redirect_uris", [])
+        client_name = body.get("client_name", "")
+
+        if not redirect_uris:
+            return jsonify({"error": "invalid_client_metadata",
+                            "error_description": "redirect_uris is required"}), 400
+
+        client_id = secrets.token_hex(16)
+        conn = psycopg2.connect(**self.pg_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris)
+                       VALUES (%s, %s, %s)""",
+                    (client_id, client_name, redirect_uris),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        base = request.host_url.rstrip('/')
+        return jsonify({
+            "client_id": client_id,
+            "client_name": client_name,
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "registration_client_uri": base + "/mcp/oauth/register",
+        }), 201
+
     def oauth_authorize(self):
-        """GET /authorize — OAuth2 authorization code endpoint with PKCE.
+        """GET /mcp/oauth/authorize — OAuth2 authorization code endpoint with PKCE.
 
         If the user is not logged in they are redirected to SSO login and
         returned here afterwards via ``session['sso_next']``.  Once logged in

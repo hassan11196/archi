@@ -164,6 +164,15 @@ _TOOLS = [
                     "type": "string",
                     "description": "Optional. Override the specific model (e.g. 'gpt-4o').",
                 },
+                "config_name": {
+                    "type": "string",
+                    "description": "Optional. The deployment config name to use (e.g. 'comp_ops'). Defaults to the active config.",
+                },
+                "client_timeout": {
+                    "type": "number",
+                    "description": "Optional. Request timeout in milliseconds (default 18000000 = 5 hours).",
+                    "default": 18000000,
+                },
             },
             "required": ["question"],
         },
@@ -325,6 +334,10 @@ def _tool_query(
     conversation_id = arguments.get("conversation_id")
     provider = arguments.get("provider") or None
     model = arguments.get("model") or None
+    config_name = arguments.get("config_name") or None
+    # client_timeout is in milliseconds (matching UI convention); convert to seconds
+    client_timeout_ms = arguments.get("client_timeout", 18000000)
+    client_timeout = float(client_timeout_ms) / 1000.0
     client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
 
@@ -339,8 +352,8 @@ def _tool_query(
         False,           # is_refresh
         now,             # server_received_msg_ts
         now.timestamp(), # client_sent_msg_ts
-        120.0,           # client_timeout
-        None,            # config_name (use active)
+        client_timeout,  # client_timeout (seconds, converted from ms)
+        config_name,     # config_name (e.g. 'comp_ops', or None for active config)
         provider=provider,
         model=model,
         user_id=user_id,

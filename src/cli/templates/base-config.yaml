@@ -53,6 +53,10 @@ services:
     update_time: {{ services.mattermost.update_time | default(60, true) }}
     port: {{ services.mattermost.port | default(5000, true) }}
     external_port: {{ services.mattermost.external_port | default(5000, true) }}
+    auth:
+      enabled: {{ services.mattermost.auth.enabled | default(false, true) }}
+      default_role: {{ services.mattermost.auth.default_role | default('base-user', true) }}
+      user_roles: {{ services.mattermost.auth.user_roles | default({}, true) | tojson }}
   redmine_mailbox:
     agent_class: {{ services.redmine_mailbox.agent_class | default('CMSCompOpsAgent', true) }}
     agents_dir: "{{ services.redmine_mailbox.agents_dir | default('', true) }}"

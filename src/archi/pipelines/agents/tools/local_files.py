@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -31,6 +32,8 @@ class RemoteCatalogClient:
         port: int = 7871,
         external_port: Optional[int] = None,
         timeout: float = 30.0,
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 1.0,
         api_token: Optional[str] = None,
     ):
         host_mode_flag = self._resolve_host_mode(host_mode)

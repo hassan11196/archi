@@ -13,6 +13,10 @@ from src.data_manager.data_manager import DataManager
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
 from src.utils.config_access import get_full_config
+from src.utils.mattermost_auth import MattermostAuthManager
+from src.utils.rbac.mattermost_context import mattermost_user_context
+from src.utils.rbac.registry import get_registry
+from src.utils.rbac.permission_enum import Permission
 
 logger = get_logger(__name__)
 
@@ -69,8 +73,14 @@ class Mattermost:
 
         logger.info('Mattermost::INIT')
 
-        self.mattermost_config = get_full_config().get("utils", {}).get("mattermost", None)
-        
+        config = get_full_config()
+        self.mattermost_config = config.get("services", {}).get("mattermost", None)
+
+        # Auth setup
+        auth_config = (self.mattermost_config or {}).get("auth", {})
+        self.auth_manager = MattermostAuthManager(auth_config)
+        self.auth_enabled = auth_config.get("enabled", False)
+
         # mattermost webhook for reading questions/sending responses
         self.mattermost_url = 'https://mattermost.web.cern.ch/'
         self.mattermost_webhook = read_secret("MATTERMOST_WEBHOOK")
@@ -214,16 +224,33 @@ class Mattermost:
             logger.error(str(e))
             return
 
-        if self.checkAnswerExist(topic['id']) :
-             # no need to answer someone already answered
-             logger.info('no need to answer someone already answered')
+        if self.checkAnswerExist(topic['id']):
+            # no need to answer someone already answered
+            logger.info('no need to answer someone already answered')
         else:
-            # otherwise, process it
+            # Build user context from post's user_id (no username available in polling mode)
+            user_id = topic.get('user_id', '')
+            ctx = self.auth_manager.build_context(user_id=user_id)
+
+            # Entry-level permission check
+            if self.auth_enabled:
+                registry = get_registry()
+                if not registry.has_permission(ctx.roles, Permission.Chat.QUERY):
+                    logger.info(
+                        f"Mattermost polling: access denied for user_id={user_id!r} "
+                        f"(roles={ctx.roles})"
+                    )
+                    self.post_response("Sorry, you don't have permission to use this bot. Please contact an administrator.")
+                    self.write_min_next_post(topic['id'])
+                    return
+
+            # Process post with user context set for tool permission checks
             try:
-                answer, post_str = self.ai_wrapper(topic)
-                print('topic',topic,' \n ANSWER: ',answer)
-                postedMM = self.post_response(answer)
-                post_str = self.write_min_next_post(topic['id'])
+                with mattermost_user_context(ctx):
+                    answer, post_str = self.ai_wrapper(topic)
+                print('topic', topic, ' \n ANSWER: ', answer)
+                self.post_response(answer)
+                self.write_min_next_post(topic['id'])
 
             except Exception as e:
                 logger.error(f"ERROR - Failed to process post {topic['id']} due to the following exception:")
@@ -246,8 +273,13 @@ class MattermostWebhookServer:
 
         self.ai_wrapper = MattermostAIWrapper()
 
-        mm_config = get_full_config().get("utils", {}).get("mattermost", {})
+        mm_config = get_full_config().get("services", {}).get("mattermost", {})
         self.port = int(mm_config.get("port", 5000))
+
+        # Auth setup
+        auth_config = mm_config.get("auth", {})
+        self.auth_manager = MattermostAuthManager(auth_config)
+        self.auth_enabled = auth_config.get("enabled", False)
 
         self.app = Flask(__name__)
         self.app.add_url_rule('/webhook', 'webhook', self._handle_webhook, methods=['POST'])
@@ -268,11 +300,37 @@ class MattermostWebhookServer:
         if not text:
             return jsonify({}), 200
 
-        logger.info(f"MattermostWebhookServer: received message: {text}")
+        # Extract user identity from Mattermost outgoing webhook payload
+        user_id = data.get('user_id', '')
+        username = data.get('user_name', '')
+        channel_id = data.get('channel_id', '')
+
+        logger.info(
+            f"MattermostWebhookServer: message from @{username} "
+            f"(id={user_id}, channel={channel_id}): {text!r}"
+        )
+
+        # Build user context and check entry-level permission
+        ctx = self.auth_manager.build_context(user_id=user_id, username=username)
+        if self.auth_enabled:
+            registry = get_registry()
+            if not registry.has_permission(ctx.roles, Permission.Chat.QUERY):
+                logger.info(
+                    f"MattermostWebhookServer: access denied for @{username} "
+                    f"(roles={ctx.roles})"
+                )
+                deny_msg = "Sorry, you don't have permission to use this bot. Please contact an administrator."
+                requests.post(
+                    self.mattermost_webhook,
+                    data=json.dumps({"text": deny_msg}),
+                    headers=self.mattermost_headers,
+                )
+                return jsonify({}), 200
 
         try:
             post = {'message': text}
-            answer, _ = self.ai_wrapper(post)
+            with mattermost_user_context(ctx):
+                answer, _ = self.ai_wrapper(post)
             requests.post(self.mattermost_webhook, data=json.dumps({"text": answer}), headers=self.mattermost_headers)
         except Exception as e:
             logger.error(f"MattermostWebhookServer: failed to process message: {e}")

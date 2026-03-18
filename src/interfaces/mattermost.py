@@ -5,7 +5,8 @@ from pathlib import Path
 from threading import Thread
 
 import requests
-from flask import Flask, request as flask_request, jsonify
+from authlib.integrations.flask_client import OAuth
+from flask import Flask, request as flask_request, jsonify, redirect, session, url_for
 
 from src.archi.archi import archi
 from src.archi.pipelines.agents.agent_spec import AgentSpecError, select_agent_spec
@@ -14,6 +15,8 @@ from src.utils.env import read_secret
 from src.utils.logging import get_logger
 from src.utils.config_access import get_full_config
 from src.utils.mattermost_auth import MattermostAuthManager
+from src.utils.mattermost_token_service import MattermostTokenService
+from src.utils.rbac.jwt_parser import get_user_roles
 from src.utils.rbac.mattermost_context import mattermost_user_context
 from src.utils.rbac.registry import get_registry
 from src.utils.rbac.permission_enum import Permission
@@ -78,7 +81,11 @@ class Mattermost:
 
         # Auth setup
         auth_config = (self.mattermost_config or {}).get("auth", {})
-        self.auth_manager = MattermostAuthManager(auth_config)
+        pg_config = {
+            "password": read_secret("PG_PASSWORD"),
+            **config.get("services", {}).get("postgres", {}),
+        }
+        self.auth_manager = MattermostAuthManager(auth_config, pg_config=pg_config)
         self.auth_enabled = auth_config.get("enabled", False)
 
         # mattermost webhook for reading questions/sending responses
@@ -228,14 +235,24 @@ class Mattermost:
             # no need to answer someone already answered
             logger.info('no need to answer someone already answered')
         else:
-            # Build user context from post's user_id (no username available in polling mode)
+            # Build user context from post's user_id (no username in polling mode)
             user_id = topic.get('user_id', '')
             ctx = self.auth_manager.build_context(user_id=user_id)
+
+            # None means db mode and no stored token — prompt user to login
+            if ctx is None:
+                login_url = self.auth_manager.login_url(user_id)
+                self.post_response(
+                    f"Hi! To use this bot, please login first: {login_url}\n"
+                    "After logging in, send your message again."
+                )
+                self.write_min_next_post(topic['id'])
+                return
 
             # Entry-level permission check
             if self.auth_enabled:
                 registry = get_registry()
-                if not registry.has_permission(ctx.roles, Permission.Chat.QUERY):
+                if not registry.has_permission(ctx.roles, Permission.Mattermost.ACCESS):
                     logger.info(
                         f"Mattermost polling: access denied for user_id={user_id!r} "
                         f"(roles={ctx.roles})"
@@ -273,16 +290,48 @@ class MattermostWebhookServer:
 
         self.ai_wrapper = MattermostAIWrapper()
 
-        mm_config = get_full_config().get("services", {}).get("mattermost", {})
+        config = get_full_config()
+        mm_config = config.get("services", {}).get("mattermost", {})
         self.port = int(mm_config.get("port", 5000))
 
         # Auth setup
         auth_config = mm_config.get("auth", {})
-        self.auth_manager = MattermostAuthManager(auth_config)
+        pg_config = {
+            "password": read_secret("PG_PASSWORD"),
+            **config.get("services", {}).get("postgres", {}),
+        }
+        self.auth_manager = MattermostAuthManager(auth_config, pg_config=pg_config)
         self.auth_enabled = auth_config.get("enabled", False)
 
+        import secrets as _secrets
         self.app = Flask(__name__)
+        self.app.secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY") or _secrets.token_hex(32)
         self.app.add_url_rule('/webhook', 'webhook', self._handle_webhook, methods=['POST'])
+
+        # SSO OAuth routes for Mattermost user authentication
+        sso_cfg = auth_config.get('sso', {})
+        self._sso_enabled = bool(read_secret("SSO_CLIENT_ID") and read_secret("SSO_CLIENT_SECRET"))
+        if self._sso_enabled:
+            self._oauth = OAuth(self.app)
+            self._oauth.register(
+                name='sso',
+                client_id=read_secret("SSO_CLIENT_ID"),
+                client_secret=read_secret("SSO_CLIENT_SECRET"),
+                server_metadata_url=sso_cfg.get(
+                    'server_metadata_url',
+                    'https://auth.cern.ch/auth/realms/cern/.well-known/openid-configuration',
+                ),
+                client_kwargs={'scope': 'openid profile email offline_access'},
+            )
+            self._token_service = MattermostTokenService(
+                pg_config=pg_config,
+                token_endpoint=sso_cfg.get('token_endpoint', ''),
+                session_lifetime_days=int(auth_config.get('session_lifetime_days', 30)),
+                roles_refresh_hours=int(auth_config.get('roles_refresh_hours', 24)),
+            )
+            self.app.add_url_rule('/mattermost-auth', 'mattermost_auth_login', self._mattermost_auth_login)
+            self.app.add_url_rule('/mattermost-auth/callback', 'mattermost_auth_callback', self._mattermost_auth_callback)
+            logger.info("MattermostWebhookServer: SSO auth routes registered")
 
     def _handle_webhook(self):
         # Mattermost outgoing webhooks send either application/x-www-form-urlencoded or application/json
@@ -310,11 +359,24 @@ class MattermostWebhookServer:
             f"(id={user_id}, channel={channel_id}): {text!r}"
         )
 
-        # Build user context and check entry-level permission
+        # Build user context — None means db mode with no stored token
         ctx = self.auth_manager.build_context(user_id=user_id, username=username)
+        if ctx is None:
+            login_url = self.auth_manager.login_url(user_id, username)
+            login_msg = (
+                f"Hi @{username}! To use this bot, please login first: {login_url}\n"
+                "After logging in, send your message again."
+            )
+            requests.post(
+                self.mattermost_webhook,
+                data=json.dumps({"text": login_msg}),
+                headers=self.mattermost_headers,
+            )
+            return jsonify({}), 200
+
         if self.auth_enabled:
             registry = get_registry()
-            if not registry.has_permission(ctx.roles, Permission.Chat.QUERY):
+            if not registry.has_permission(ctx.roles, Permission.Mattermost.ACCESS):
                 logger.info(
                     f"MattermostWebhookServer: access denied for @{username} "
                     f"(roles={ctx.roles})"
@@ -336,6 +398,67 @@ class MattermostWebhookServer:
             logger.error(f"MattermostWebhookServer: failed to process message: {e}")
 
         return jsonify({}), 200
+
+    def _mattermost_auth_login(self):
+        """
+        Step 1: user clicks the login link from Mattermost.
+        Stashes mm_username in session, then redirects to CERN SSO.
+        mm_user_id is passed as OAuth state and round-tripped back by SSO.
+        """
+        mm_user_id = flask_request.args.get('state', '').strip()
+        mm_username = flask_request.args.get('username', '').strip()
+        if not mm_user_id:
+            return "Missing Mattermost user ID", 400
+        session['_mm_pending_username'] = mm_username
+        redirect_uri = url_for('mattermost_auth_callback', _external=True)
+        return self._oauth.sso.authorize_redirect(redirect_uri, state=mm_user_id)
+
+    def _mattermost_auth_callback(self):
+        """
+        Step 2: CERN SSO redirects back here after the user authenticates.
+        Extracts roles from the JWT and stores them in mattermost_tokens.
+        """
+        try:
+            token = self._oauth.sso.authorize_access_token()
+            mm_user_id = flask_request.args.get('state', '').strip()
+            mm_username = session.pop('_mm_pending_username', '')
+
+            if not mm_user_id:
+                return "Missing Mattermost user ID in callback state", 400
+
+            user_info = token.get('userinfo') or self._oauth.sso.userinfo(token=token)
+            user_email = user_info.get('email', user_info.get('preferred_username', ''))
+            user_roles = get_user_roles(token, user_email)
+
+            self._token_service.store_token(
+                mm_user_id=mm_user_id,
+                mm_username=mm_username or user_info.get('preferred_username', ''),
+                email=user_email,
+                roles=user_roles,
+                refresh_token=token.get('refresh_token'),
+            )
+
+            logger.info(
+                f"Mattermost auth successful: @{mm_username} (id={mm_user_id!r}) "
+                f"email={user_email!r} roles={user_roles}"
+            )
+            return (
+                "<html><body style='font-family:sans-serif;padding:2em'>"
+                "<h2>Login successful!</h2>"
+                f"<p>You are now authenticated as <strong>{user_email}</strong> "
+                f"with roles: <strong>{', '.join(user_roles)}</strong>.</p>"
+                "<p>You can close this tab and return to Mattermost.</p>"
+                "</body></html>"
+            )
+        except Exception as exc:
+            logger.error(f"Mattermost auth callback error: {exc}")
+            return (
+                "<html><body style='font-family:sans-serif;padding:2em'>"
+                "<h2>Authentication failed</h2>"
+                f"<p>Error: {exc}</p>"
+                "<p>Please try clicking the login link in Mattermost again.</p>"
+                "</body></html>"
+            ), 500
 
     def run(self, host='0.0.0.0', port=5000):
         logger.info(f'MattermostWebhookServer: starting on {host}:{port}')

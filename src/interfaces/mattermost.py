@@ -1,12 +1,14 @@
 import json
 import os
 import time
+from pathlib import Path
 from threading import Thread
 
 import requests
-from flask import Flask
+from flask import Flask, request as flask_request, jsonify
 
 from src.archi.archi import archi
+from src.archi.pipelines.agents.agent_spec import AgentSpecError, select_agent_spec
 from src.data_manager.data_manager import DataManager
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
@@ -19,8 +21,28 @@ class MattermostAIWrapper:
         # initialize and update vector store
         self.data_manager = DataManager(run_ingestion=False)
 
-        # intialize chain
-        self.archi = archi()
+        # initialize chain
+        config = get_full_config()
+        services_cfg = config.get("services", {})
+        mm_cfg = services_cfg.get("mattermost", {})
+        chat_cfg = services_cfg.get("chat_app", {})
+        agent_class = mm_cfg.get("agent_class") or chat_cfg.get("agent_class", "QAPipeline")
+        agents_dir = mm_cfg.get("agents_dir") or chat_cfg.get("agents_dir")
+        agent_spec = None
+        if agents_dir:
+            try:
+                agent_spec = select_agent_spec(Path(agents_dir))
+            except AgentSpecError as exc:
+                logger.warning(f"Failed to load agent spec: {exc}")
+                agent_spec = None
+        prompt_overrides = mm_cfg.get("prompts", {})
+        self.archi = archi(
+            pipeline=agent_class,
+            agent_spec=agent_spec,
+            default_provider=mm_cfg.get("default_provider") or chat_cfg.get("default_provider"),
+            default_model=mm_cfg.get("default_model") or chat_cfg.get("default_model"),
+            prompt_overrides=prompt_overrides,
+        )
 
     def __call__(self, post):
 
@@ -31,8 +53,8 @@ class MattermostAIWrapper:
         formatted_history.append(("User", post_str)) 
 
         # call chain
-        answer = self.archi(formatted_history)["answer"]
-        logger.debug('ANSWER = ',answer)
+        answer = self.archi(history=formatted_history)["answer"]
+        logger.debug('ANSWER = %s', answer)
 
         return answer, post_str
 
@@ -60,10 +82,10 @@ class Mattermost:
             'Content-Type': 'application/json'
         }
 
-        logger.debug('mattermost_webhook =', self.mattermost_webhook)
-        logger.debug('mattermost_channel_id_read =', self.mattermost_channel_id_read)
-        logger.debug('mattermost_channel_id_write =', self.mattermost_channel_id_write)
-        logger.debug('PAK =', self.PAK)
+        logger.debug('mattermost_webhook = %s', self.mattermost_webhook)
+        logger.debug('mattermost_channel_id_read = %s', self.mattermost_channel_id_read)
+        logger.debug('mattermost_channel_id_write = %s', self.mattermost_channel_id_write)
+        logger.debug('PAK = %s', self.PAK)
 
         # initialize MattermostAIWrapper
         self.ai_wrapper = MattermostAIWrapper()
@@ -161,7 +183,7 @@ class Mattermost:
             # Load existing data
             with open(self.min_next_post_file, "r") as f:
                 data = json.load(f)
-                logger.info("Loaded data:", data)
+                logger.info("Loaded data: %s", data)
 
         answered_ids = data.get("answered_id", [])
 
@@ -206,3 +228,57 @@ class Mattermost:
             except Exception as e:
                 logger.error(f"ERROR - Failed to process post {topic['id']} due to the following exception:")
                 logger.error(str(e))
+
+
+class MattermostWebhookServer:
+    """
+    Event-driven alternative to the polling-based Mattermost class.
+    Runs a Flask HTTP server that receives messages via an outgoing webhook
+    (Mattermost pushes POSTs here) and replies via an incoming webhook.
+    No Personal Access Token required.
+    """
+    def __init__(self):
+        logger.info('MattermostWebhookServer::INIT')
+
+        self.mattermost_webhook = read_secret("MATTERMOST_WEBHOOK")
+        self.outgoing_token = read_secret("MATTERMOST_OUTGOING_TOKEN")
+        self.mattermost_headers = {'Content-Type': 'application/json'}
+
+        self.ai_wrapper = MattermostAIWrapper()
+
+        mm_config = get_full_config().get("utils", {}).get("mattermost", {})
+        self.port = int(mm_config.get("port", 5000))
+
+        self.app = Flask(__name__)
+        self.app.add_url_rule('/webhook', 'webhook', self._handle_webhook, methods=['POST'])
+
+    def _handle_webhook(self):
+        # Mattermost outgoing webhooks send either application/x-www-form-urlencoded or application/json
+        if flask_request.is_json:
+            data = flask_request.get_json(silent=True) or {}
+        else:
+            data = flask_request.form
+
+        token = data.get('token', '')
+        if self.outgoing_token and token != self.outgoing_token:
+            logger.warning('MattermostWebhookServer: received request with invalid token')
+            return jsonify({}), 403
+
+        text = data.get('text', '').strip()
+        if not text:
+            return jsonify({}), 200
+
+        logger.info(f"MattermostWebhookServer: received message: {text}")
+
+        try:
+            post = {'message': text}
+            answer, _ = self.ai_wrapper(post)
+            requests.post(self.mattermost_webhook, data=json.dumps({"text": answer}), headers=self.mattermost_headers)
+        except Exception as e:
+            logger.error(f"MattermostWebhookServer: failed to process message: {e}")
+
+        return jsonify({}), 200
+
+    def run(self, host='0.0.0.0', port=5000):
+        logger.info(f'MattermostWebhookServer: starting on {host}:{port}')
+        self.app.run(host=host, port=port)

@@ -1,0 +1,51 @@
+# Archi deployment with Open WebUI as the chat frontend.
+#
+# Open WebUI connects to Archi's OpenAI-compatible API (/v1) so all
+# RAG pipelines, agents, and tool traces are available through the
+# polished Open WebUI interface.
+#
+# run with:
+# archi create --name my-archi-openwebui --config examples/deployments/openwebui/config.yaml --services chatbot,openwebui --hostmode
+#
+# required env var:
+# export OPENAI_API_KEY=your_api_key
+
+name: my_archi_openwebui
+
+services:
+  chat_app:
+    agent_class: CMSCompOpsAgent
+    agents_dir: examples/agents
+    client_timeout_seconds: 1800
+    default_provider: openai
+    default_model: gpt-4o
+    providers:
+      openai:
+        enabled: true
+        default_model: "gpt-4o"
+        models:
+          - "gpt-4o"
+          - "gpt-5"
+      local:
+        enabled: false
+    trained_on: "My data"
+    port: 7861
+    external_port: 7861
+  openwebui:
+    enabled: true
+    port: 8080
+    external_port: 3080
+  vectorstore:
+    backend: postgres
+  data_manager:
+    port: 7871
+    external_port: 7871
+    auth:
+      enabled: false
+
+data_manager:
+  sources:
+    links:
+      input_lists:
+        - examples/deployments/basic-openai/miscellanea.list
+  embedding_name: HuggingFaceEmbeddings

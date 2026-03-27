@@ -154,10 +154,23 @@ class ServiceRegistry:
         self.register(ServiceDefinition(
             name='benchmarking',
             depends_on=['postgres'],
-            requires_volume=True, 
+            requires_volume=True,
             description='Benchmarking runtime, its not really a service but under the hood it will be',
             category='benchmarking runtime', # not technically a service
             volume_name_pattern="archi-benchmark-{name}",
+        ))
+
+        self.register(ServiceDefinition(
+            name='openwebui',
+            description='Open WebUI - feature-rich chat interface powered by Archi backend',
+            category='application',
+            requires_image=False,  # Uses upstream ghcr.io/open-webui/open-webui image
+            requires_volume=True,
+            depends_on=['chatbot'],
+            default_host_port=3080,
+            default_container_port=8080,
+            port_config_path='services.openwebui',
+            volume_name_pattern="archi-openwebui-{name}",
         ))
     
     def register(self, service_def: ServiceDefinition):

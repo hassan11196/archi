@@ -139,6 +139,10 @@ services:
     backend: postgres
     # Distance metric for similarity search: "cosine", "l2", "inner_product"
     distance_metric: {{ services.vectorstore.distance_metric | default('cosine', true) }}
+  openwebui:
+    enabled: {{ services.openwebui.enabled | default(false, true) }}
+    port: {{ services.openwebui.port | default(8080, true) }}
+    external_port: {{ services.openwebui.external_port | default(3080, true) }}
   grafana:
     port: {{ services.grafana.port | default(3000, true) }}
     external_port: {{ services.grafana.external_port | default(3000, true) }}

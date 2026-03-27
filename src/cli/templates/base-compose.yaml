@@ -571,6 +571,40 @@ services:
     {%- endif %}
   {%- endif %}
 
+  {% if openwebui_enabled -%}
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui-{{ name }}
+    {% if chatbot_enabled -%}
+    depends_on:
+      chatbot:
+        condition: service_started
+    {% endif -%}
+    environment:
+      # Point OpenWebUI at Archi's OpenAI-compatible API
+      OPENAI_API_BASE_URL: http://{{ 'localhost' if host_mode else 'chatbot' }}:{{ chatbot_port_container }}/v1
+      OPENAI_API_KEY: archi-internal
+      # Disable OpenWebUI's built-in auth (Archi handles auth)
+      WEBUI_AUTH: "false"
+      # Disable default Ollama connection (Archi proxies all models)
+      ENABLE_OLLAMA_API: "false"
+      OLLAMA_BASE_URL: ""
+      # Customise branding
+      WEBUI_NAME: "Archi AI"
+      ENABLE_SIGNUP: "false"
+    volumes:
+      - {{ openwebui_volume_name }}:/app/backend/data
+    logging:
+      options:
+        max-size: 10m
+    ports:
+      - {{ openwebui_port_host }}:{{ openwebui_port_container }}
+    restart: always
+    {% if host_mode -%}
+    network_mode: host
+    {% endif %}
+  {%- endif %}
+
   {% if benchmarking_enabled -%}
   benchmark:
     image: {{ benchmarking_image }}:{{ benchmarking_tag }}

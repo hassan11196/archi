@@ -2289,6 +2289,13 @@ class FlaskAppWrapper(object):
             require_auth=self.require_auth,
         )
 
+        # OpenAI-compatible API for OpenWebUI integration
+        logger.info("Adding OpenAI-compatible API endpoints")
+        self.app.chat_wrapper = self.chat
+        self.app._archi_auth_enabled = self.auth_enabled
+        from src.interfaces.chat_app.openai_adapter import register_openai_api
+        register_openai_api(self.app)
+
         # add unified auth endpoints
         if self.auth_enabled:
             logger.info("Adding unified authentication endpoints")

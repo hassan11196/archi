@@ -60,6 +60,7 @@ from src.utils.sql import (
     SQL_GET_PENDING_AB_COMPARISON, SQL_DELETE_AB_COMPARISON, SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+    SQL_LIST_CONVERSATIONS_ALL_SOURCES, SQL_GET_CONVERSATION_METADATA_ALL_SOURCES,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.service_alerts import (
@@ -67,6 +68,7 @@ from src.interfaces.chat_app.service_alerts import (
 )
 from src.interfaces.chat_app.utils import collapse_assistant_sequences
 from src.utils.user_service import UserService
+from src.utils.sso_token_service import SSOTokenService
 
 # RBAC imports for role-based access control
 from src.utils.rbac import (
@@ -1120,6 +1122,12 @@ class ChatWrapper:
         # update timestamp
         if user_id:
             cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER, (now, conversation_id, user_id, client_id))
+            if cursor.rowcount == 0:
+                # Mattermost-originated conversation: client_id is "mm_user_<username>"
+                username = session.get('user', {}).get('username', '') or ''
+                if username:
+                    mm_client_id = f"mm_user_{username}"
+                    cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER, (now, conversation_id, user_id, mm_client_id))
         else:
             cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
         conn.commit()
@@ -1562,7 +1570,7 @@ class ChatWrapper:
             requested_config = self._resolve_config_name(config_name)
             self.update_config(config_name=requested_config)
 
-            result = self.archi(history=context.history, conversation_id=context.conversation_id)
+            result = self.archi(history=context.history, conversation_id=context.conversation_id, user_id=user_id)
             timestamps["chain_finished_ts"] = datetime.now(timezone.utc)
 
             # keep track of total number of queries and log this amount
@@ -1712,7 +1720,7 @@ class ChatWrapper:
                 pipeline_name=self.archi.pipeline_name if hasattr(self.archi, 'pipeline_name') else None,
             )
 
-            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id):
+            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id, user_id=user_id):
                 if client_timeout and time.time() - stream_start_time > client_timeout:
                     if trace_id:
                         total_duration_ms = int((time.time() - stream_start_time) * 1000)
@@ -2301,6 +2309,8 @@ class FlaskAppWrapper(object):
             
             if self.sso_enabled:
                 self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
+                self.add_endpoint('/mcp/authorize', 'mcp_authorize', self.mcp_authorize, methods=['GET'])
+                self.add_endpoint('/mcp/callback', 'mcp_callback', self.mcp_callback, methods=['GET'])
 
     def _set_user_session(self, email: str, name: str, username: str, user_id: str = '', auth_method: str = 'sso', roles: list = None):
         """Set user session with well-defined structure."""
@@ -2357,6 +2367,29 @@ class FlaskAppWrapper(object):
         )
         
         logger.info(f"SSO configured with server: {server_metadata_url}")
+
+        # Derive token endpoint for silent refresh (Keycloak-style metadata URL)
+        token_endpoint = sso_config.get('token_endpoint', '')
+        if not token_endpoint and server_metadata_url:
+            import re as _re
+            token_endpoint = _re.sub(r'/\.well-known/.*', '/protocol/openid-connect/token', server_metadata_url)
+
+        session_lifetime_days = self.chat_app_config.get('auth', {}).get('session_lifetime_days', 30)
+        self.sso_token_service = SSOTokenService(
+            pg_config=self.pg_config,
+            token_endpoint=token_endpoint,
+            session_lifetime_days=int(session_lifetime_days),
+        )
+
+        # MCP OAuth2 service — handles per-server authorization code + PKCE flow
+        from src.utils.mcp_oauth_service import MCPOAuthService
+        from src.utils.config_access import get_mcp_servers_config as _get_mcp_cfg
+        mcp_server_cfg = self.config.get('services', {}).get('mcp_server', {})
+        app_base_url = mcp_server_cfg.get('url', '') or f"http://localhost:{self.chat_app_config.get('port', 7861)}"
+        self.mcp_oauth_service = MCPOAuthService(
+            pg_config=self.pg_config,
+            app_base_url=app_base_url,
+        )
 
     def login(self):
         """Unified login endpoint supporting multiple auth methods"""
@@ -2465,7 +2498,20 @@ class FlaskAppWrapper(object):
                 auth_method='sso',
                 roles=user_roles
             )
-            
+
+            # Persist access + refresh tokens in DB so SSO-auth MCP servers can
+            # authenticate on behalf of this user across requests.
+            if sso_user_id and token.get('access_token'):
+                try:
+                    self.sso_token_service.store_token(
+                        user_id=sso_user_id,
+                        access_token=token['access_token'],
+                        refresh_token=token.get('refresh_token'),
+                        expires_in=int(token.get('expires_in', 300)),
+                    )
+                except Exception as te:
+                    logger.warning(f"Failed to persist SSO token for MCP auth: {te}")
+
             # Log successful authentication
             log_authentication_event(
                 user=user_email,
@@ -2476,7 +2522,21 @@ class FlaskAppWrapper(object):
             )
             
             logger.info(f"SSO login successful for user: {user_email} with roles: {user_roles}")
-            
+
+            # After login, authorize any MCP servers that need it
+            # Use preferred_username (same key used by Mattermost) so token lookups match.
+            mcp_user_id = user_info.get('preferred_username', '') or sso_user_id
+            if hasattr(self, 'mcp_oauth_service') and mcp_user_id:
+                try:
+                    from src.utils.config_access import get_mcp_servers_config as _get_mcp
+                    mcp_servers = _get_mcp()
+                    needing = self.mcp_oauth_service.get_servers_needing_auth(mcp_user_id, mcp_servers)
+                    if needing:
+                        logger.info(f"Redirecting user {mcp_user_id!r} to authorize MCP server(s): {needing}")
+                        return redirect(url_for('mcp_authorize', server=needing[0], next=url_for('index')))
+                except Exception as me:
+                    logger.warning(f"MCP auth check failed after login: {me}")
+
             # Redirect to main page
             return redirect(url_for('index'))
             
@@ -2491,6 +2551,93 @@ class FlaskAppWrapper(object):
             )
             flash(f"Authentication failed: {str(e)}")
             return redirect(url_for('login'))
+
+    def mcp_authorize(self):
+        """Redirect user to an MCP server's OAuth2 authorization endpoint."""
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+
+        server_name = request.args.get('server', '')
+        next_url = request.args.get('next', url_for('index'))
+
+        from src.utils.config_access import get_mcp_servers_config as _get_mcp
+        mcp_servers = _get_mcp()
+        server_cfg = mcp_servers.get(server_name)
+        if not server_cfg or not server_cfg.get('sso_auth'):
+            logger.warning(f"mcp_authorize: unknown or non-sso_auth server '{server_name}'")
+            return redirect(next_url)
+
+        server_url = server_cfg.get('url', '')
+        result = self.mcp_oauth_service.get_authorization_url(server_name, server_url)
+        if not result:
+            logger.error(f"mcp_authorize: could not build auth URL for '{server_name}'")
+            flash(f"Could not connect to MCP server '{server_name}'. Check logs for details.")
+            return redirect(next_url)
+
+        auth_url, state, code_verifier = result
+        session[f'mcp_state_{server_name}'] = state
+        session[f'mcp_verifier_{server_name}'] = code_verifier
+        session['mcp_pending_server'] = server_name
+        session['mcp_next_url'] = next_url
+        logger.info(f"Redirecting user to MCP OAuth for server '{server_name}'")
+        return redirect(auth_url)
+
+    def mcp_callback(self):
+        """Handle the OAuth2 callback from an MCP server."""
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+
+        code = request.args.get('code', '')
+        state = request.args.get('state', '')
+        error = request.args.get('error', '')
+
+        server_name = session.pop('mcp_pending_server', '')
+        next_url = session.pop('mcp_next_url', url_for('index'))
+
+        if error or not code or not server_name:
+            logger.warning(f"MCP callback error for '{server_name}': error={error!r}, code present={bool(code)}")
+            flash(f"MCP authorization failed for '{server_name}': {error or 'missing code'}")
+            return redirect(next_url)
+
+        expected_state = session.pop(f'mcp_state_{server_name}', '')
+        code_verifier = session.pop(f'mcp_verifier_{server_name}', '')
+
+        if state != expected_state:
+            logger.error(f"MCP callback state mismatch for '{server_name}'")
+            flash("MCP authorization failed: state mismatch.")
+            return redirect(next_url)
+
+        token_data = self.mcp_oauth_service.exchange_code(server_name, code, code_verifier)
+        if not token_data or not token_data.get('access_token'):
+            logger.error(f"MCP token exchange failed for '{server_name}'")
+            flash(f"MCP authorization failed for '{server_name}': token exchange error.")
+            return redirect(next_url)
+
+        # Use preferred_username as the MCP token key so that Mattermost lookups
+        # (which pass ctx.username = preferred_username) find the stored token.
+        # Fall back to SSO sub UUID only if username is absent.
+        user_id = session.get('user', {}).get('username', '') or session.get('user', {}).get('id', '')
+        self.mcp_oauth_service.store_user_token(
+            user_id=user_id,
+            server_name=server_name,
+            access_token=token_data['access_token'],
+            refresh_token=token_data.get('refresh_token'),
+            expires_in=int(token_data.get('expires_in', 3600)),
+        )
+        logger.info(f"MCP OAuth complete for user={user_id!r}, server='{server_name}'")
+
+        # If more servers need auth, chain to next one
+        if hasattr(self, 'mcp_oauth_service') and user_id:
+            try:
+                from src.utils.config_access import get_mcp_servers_config as _get_mcp
+                mcp_servers = _get_mcp()
+                needing = self.mcp_oauth_service.get_servers_needing_auth(user_id, mcp_servers)
+                if needing:
+                    return redirect(url_for('mcp_authorize', server=needing[0], next=next_url))
+            except Exception as me:
+                logger.warning(f"MCP chain auth check failed: {me}")
+
+        return redirect(next_url)
 
     def get_user(self):
         """API endpoint to get current user information including roles and permissions"""
@@ -3802,7 +3949,10 @@ class FlaskAppWrapper(object):
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
             if user_id:
-                cursor.execute(SQL_LIST_CONVERSATIONS_BY_USER, (user_id, client_id, limit))
+                # Include Mattermost-originated conversations via "mm_user_<username>" client_id
+                username = session.get('user', {}).get('username', '') or ''
+                mm_client_id = f"mm_user_{username}" if username else ""
+                cursor.execute(SQL_LIST_CONVERSATIONS_ALL_SOURCES, (user_id, client_id, mm_client_id, limit))
             else:
                 cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
             rows = cursor.fetchall()
@@ -3814,6 +3964,7 @@ class FlaskAppWrapper(object):
                     'title': row[1] or "New Chat",
                     'created_at': row[2].isoformat() if row[2] else None,
                     'last_message_at': row[3].isoformat() if row[3] else None,
+                    'archi_service': row[4] if len(row) > 4 else 'chat',
                 })
 
             # clean up database connection state
@@ -3853,9 +4004,11 @@ class FlaskAppWrapper(object):
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
 
-            # get conversation metadata
+            # get conversation metadata — include Mattermost conversations for authenticated users
             if user_id:
-                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+                username = session.get('user', {}).get('username', '') or ''
+                mm_client_id = f"mm_user_{username}" if username else ""
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_ALL_SOURCES, (conversation_id, user_id, client_id, mm_client_id))
             else:
                 cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             meta_row = cursor.fetchone()
@@ -3918,6 +4071,7 @@ class FlaskAppWrapper(object):
                 'title': meta_row[1] or "New Conversation",
                 'created_at': meta_row[2].isoformat() if meta_row[2] else None,
                 'last_message_at': meta_row[3].isoformat() if meta_row[3] else None,
+                'archi_service': meta_row[4] if len(meta_row) > 4 else 'chat',
                 'messages': messages
             }
 

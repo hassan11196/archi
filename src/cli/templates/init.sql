@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, server_name)
+);
+
 -- 1.2 MCP API TOKENS (VS Code / Cursor integration)
 -- ============================================================================
 
